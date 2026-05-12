@@ -54,54 +54,35 @@ class AnnealingPlacer:
         
         return is_overlapping
 
-    def _is_valid_move(self, idx: int, new_pos: torch.Tensor, placement: torch.Tensor, benchmark: Benchmark) -> bool:
-        """Checks if a move for a hard macro is legal (no hard-on-hard overlaps)."""
-        if idx >= benchmark.num_hard_macros:
-            return True
-            
-        num_hard = benchmark.num_hard_macros
-        other_indices = torch.cat([torch.arange(0, idx), torch.arange(idx + 1, num_hard)])
-        if len(other_indices) == 0: return True
-            
-        pos_others = placement[other_indices]
-        size_others = benchmark.macro_sizes[other_indices]
-        size_idx = benchmark.macro_sizes[idx]
-        
-        dist = torch.abs(new_pos - pos_others)
-        min_sep = (size_idx + size_others) / 2.0 + self.margin
-        
-        return not torch.all(dist < min_sep, dim=1).any().item()
-
-    def _propose_batch_moves(self, current_placement: torch.Tensor, is_overlapping: torch.Tensor, 
+    
+    
+    def _propose_batch_moves(self, current_placement: torch.Tensor, 
                              movable_indices: torch.Tensor, temp: float, prob: float, 
                              benchmark: Benchmark) -> Tuple[List[int], List[torch.Tensor], int]:
-        """Proposes a batch of moves using random nudging."""
+        """Proposes a batch of moves using random nudging (no legality checks)."""
         moved_indices, old_positions = [], []
         attempted_count = 0
-        num_hard = benchmark.num_hard_macros
         canvas_size = torch.tensor([benchmark.canvas_width, benchmark.canvas_height])
-        
+
         for idx_tensor in movable_indices:
             idx = idx_tensor.item()
-            is_hard = (idx < num_hard)
-            
-            if (is_hard and is_overlapping[idx]) or random.random() < prob:
+
+            if random.random() < prob:
                 attempted_count += 1
                 old_pos = current_placement[idx].clone()
                 size = benchmark.macro_sizes[idx]
-                
+
                 # Nudge
                 scale = self.step_scale * (temp / self.initial_temp)
                 nudge = (torch.rand(2) - 0.5) * scale * canvas_size
                 half_size = size / 2.0
                 new_pos = torch.clamp(old_pos + nudge, min=half_size, max=canvas_size - half_size)
-                
-                # Legality check (Hard macros must not overlap)
-                if self._is_valid_move(idx, new_pos, current_placement, benchmark):
-                    current_placement[idx] = new_pos
-                    moved_indices.append(idx)
-                    old_positions.append(old_pos)
-        
+
+                # Apply move without overlap legality checks
+                current_placement[idx] = new_pos
+                moved_indices.append(idx)
+                old_positions.append(old_pos)
+
         return moved_indices, old_positions, attempted_count
 
     def _evaluate_and_accept_batch(self, current_placement: torch.Tensor, current_cost: float, 
@@ -182,7 +163,7 @@ class AnnealingPlacer:
             num_illegal = is_overlapping.sum().item()
             
             moved_indices, old_positions, attempted = self._propose_batch_moves(
-                current_placement, is_overlapping, movable_indices, temp, prob, benchmark
+                current_placement, movable_indices, temp, prob, benchmark
             )
             
             if moved_indices:
