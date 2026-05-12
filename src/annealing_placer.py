@@ -84,9 +84,29 @@ class AnnealingPlacer:
             new_pos = torch.clamp(old_pos + nudge, min=half_size, max=canvas_size - half_size)
             
             current_placement[idx] = new_pos
+            
+            # 2. Prevent invalid movements: hard macro overlap check
+            if idx < benchmark.num_hard_macros:
+                num_hard = benchmark.num_hard_macros
+                # Compare moved macro against all other hard macros
+                other_hard_indices = torch.cat([torch.arange(0, idx), torch.arange(idx + 1, num_hard)])
+                if len(other_hard_indices) > 0:
+                    pos_others = current_placement[other_hard_indices]
+                    size_others = benchmark.macro_sizes[other_hard_indices]
+                    size_idx = benchmark.macro_sizes[idx]
+                    
+                    dist = torch.abs(new_pos - pos_others)
+                    min_sep = (size_idx + size_others) / 2.0
+                    # Overlap occurs if distance < min_sep in both dimensions
+                    overlapping = torch.all(dist < min_sep, dim=1).any().item()
+                    
+                    if overlapping:
+                        current_placement[idx] = old_pos # Backtrack immediately
+                        continue
+
             new_cost = self.compute_cost(current_placement, benchmark)
             
-            # 2. Accept or Reject (Metropolis Criterion)
+            # 3. Accept or Reject (Metropolis Criterion)
             delta = new_cost - current_cost
             if delta < 0 or random.random() < math.exp(-delta / temp):
                 current_cost = new_cost
