@@ -141,7 +141,7 @@ def calculate_congestion_rudy(placement: torch.Tensor, benchmark: Benchmark) -> 
     top_values, _ = torch.topk(congestion_grid.view(-1), top_k)
     return top_values.mean().item()
 
-def compute_proxy_cost_benchmark(
+def estimate_cost(
     placement: torch.Tensor, 
     benchmark: Benchmark, 
     weights: Optional[Dict[str, float]] = None
@@ -190,7 +190,7 @@ if __name__ == "__main__":
         
         print("\n--- Comparison ---")
         gt_metrics = compute_proxy_cost(benchmark.macro_positions, benchmark, plc)
-        pt_metrics = compute_proxy_cost_benchmark(benchmark.macro_positions, benchmark)
+        pt_metrics = estimate_cost(benchmark.macro_positions, benchmark)
         
         for k in pt_metrics.keys():
             gt_val = gt_metrics.get(k, 0.0)

@@ -1,8 +1,18 @@
 import torch
 import math
 import random
+import os
+import sys
 from typing import List, Tuple
+
+# Add the project root to sys.path to allow importing 'utils' from the root
+# This is required because 'evaluate' loads this file as a standalone module.
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if project_root not in sys.path:
+    sys.path.append(project_root)
+
 from macro_place.benchmark import Benchmark
+from utils.cost_utils import estimate_cost
 
 class AnnealingPlacer:
     """
@@ -22,18 +32,6 @@ class AnnealingPlacer:
         self.step_scale = step_scale
         self.margin = margin
         self.cool_interval = cool_interval
-
-    def _calculate_hpwl(self, placement: torch.Tensor, benchmark: Benchmark) -> float:
-        """Calculates the Half-Perimeter Wirelength (HPWL)."""
-        all_pos = torch.cat([placement, benchmark.port_positions], dim=0)
-        hpwl = 0.0
-        for net_indices in benchmark.net_nodes:
-            if len(net_indices) < 2: continue
-            net_pos = all_pos[net_indices]
-            x_min, x_max = net_pos[:, 0].min(), net_pos[:, 0].max()
-            y_min, y_max = net_pos[:, 1].min(), net_pos[:, 1].max()
-            hpwl += (x_max - x_min) + (y_max - y_min)
-        return hpwl.item()
 
     def _get_overlap_mask(self, placement: torch.Tensor, benchmark: Benchmark) -> torch.Tensor:
         """Returns a mask of overlapping HARD macros only using distance checks."""
@@ -115,29 +113,9 @@ class AnnealingPlacer:
         return temp, prob
 
     def compute_cost(self, placement: torch.Tensor, benchmark: Benchmark) -> float:
-        """HPWL + All Macro Overlap Penalty."""
-        # 1. HPWL
-        all_pos = torch.cat([placement, benchmark.port_positions], dim=0)
-        hpwl = 0.0
-        for net_indices in benchmark.net_nodes:
-            if len(net_indices) < 2: continue
-            net_pos = all_pos[net_indices]
-            x_min, x_max = net_pos[:, 0].min(), net_pos[:, 0].max()
-            y_min, y_max = net_pos[:, 1].min(), net_pos[:, 1].max()
-            hpwl += (x_max - x_min) + (y_max - y_min)
-            
-        # 2. Overlap Penalty (All macros)
-        overlap_penalty = 0.0
-        num_macros = benchmark.num_macros
-        pos, sizes = placement, benchmark.macro_sizes
-        for i in range(num_macros):
-            dist = torch.abs(pos[i] - pos[i+1:])
-            min_sep = (sizes[i] + sizes[i+1:]) / 2.0 + self.margin
-            overlap = torch.clamp(min_sep - dist, min=0)
-            overlap_area = overlap[:, 0] * overlap[:, 1]
-            overlap_penalty += overlap_area.sum().item()
-            
-        return hpwl.item() + (overlap_penalty * 100.0)
+        """Calculate total proxy cost (WL + Density + Congestion)."""
+        metrics = estimate_cost(placement, benchmark)
+        return metrics["proxy_cost"]
 
     def place(self, benchmark: Benchmark) -> torch.Tensor:
         """Simulated annealing with batch moves and distance-based constraints."""
