@@ -11,7 +11,7 @@ class AnnealingPlacer:
     random perturbations and an exponential cooling schedule.
     """
 
-    def __init__(self, iterations: int = 1000, initial_temp: float = 1000.0, cooling_rate: float = 0.95):
+    def __init__(self, iterations: int = 10000, initial_temp: float = 1., cooling_rate: float = 0.99):
         self.iterations = iterations
         self.initial_temp = initial_temp
         self.cooling_rate = cooling_rate
@@ -97,9 +97,11 @@ class AnnealingPlacer:
                 current_placement[idx] = old_pos # Backtrack
             
             # 3. Cooling
-            if i % (self.iterations // 10) == 0:
+            if i % 100 == 0:
                 temp *= self.cooling_rate
                 print(f"  Iteration {i}/{self.iterations}, cost={current_cost:.2f}, temp={temp:.2f}")
+            if temp < 0.1:
+                break
 
         print(f"SA Finished: best_cost={best_cost:.2f}")
         return best_placement
