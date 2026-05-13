@@ -1,157 +1,110 @@
+import os
+import sys
+from pathlib import Path
+
+# Add project root to sys.path to ensure 'utils' package is findable
+project_root = str(Path(__file__).resolve().parent.parent)
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+
 import torch
 import math
 import random
-import os
-import sys
-from typing import List, Tuple
-
-# Add the project root to sys.path to allow importing 'utils' from the root
-# This is required because 'evaluate' loads this file as a standalone module.
-project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-if project_root not in sys.path:
-    sys.path.append(project_root)
-
 from macro_place.benchmark import Benchmark
-from utils.cost_utils import estimate_cost
+try:
+    from utils.cost_utils import CostEstimator
+except ImportError:
+    # Fallback for different execution environments
+    from chip_check.utils.cost_utils import CostEstimator
 
-class AnnealingPlacer:
+class AnnealerPlacer:
     """
-    Simulated Annealing Placer with Batch Moves and Hard Macro Constraints.
-    
-    Uses distance-based checks for overlaps and random perturbations for moves.
+    A fast Simulated Annealing placer using incremental cost updates.
+    Optimizes for Wirelength, Density, Congestion, and Legal Placement (overlaps).
     """
-
-    def __init__(self, iterations: int = 1000, initial_temp: float = 1.0, 
-                 cooling_rate: float = 0.95, initial_prob: float = 0.5, 
-                 step_scale: float = 0.1, margin: float = 0.1, 
-                 cool_interval: int = 1):
+    def __init__(self, seed: int = 42, iterations: int = 20000, initial_temp: float = 1.0, cooling_rate: float = 0.9998):
+        self.seed = seed
         self.iterations = iterations
         self.initial_temp = initial_temp
         self.cooling_rate = cooling_rate
-        self.initial_prob = initial_prob
-        self.step_scale = step_scale
-        self.margin = margin
-        self.cool_interval = cool_interval
-
-    def _get_overlap_mask(self, placement: torch.Tensor, benchmark: Benchmark) -> torch.Tensor:
-        """Returns a mask of overlapping HARD macros only using distance checks."""
-        num_hard = benchmark.num_hard_macros
-        is_overlapping = torch.zeros(benchmark.num_macros, dtype=torch.bool)
-        if num_hard <= 1: return is_overlapping
-        
-        pos_hard = placement[:num_hard]
-        size_hard = benchmark.macro_sizes[:num_hard]
-        
-        # O(N^2) Distance Matrix
-        dist = torch.abs(pos_hard.unsqueeze(1) - pos_hard.unsqueeze(0))
-        min_sep = (size_hard.unsqueeze(1) + size_hard.unsqueeze(0)) / 2.0 + self.margin
-        
-        overlap_matrix = torch.all(dist < min_sep, dim=2)
-        overlap_matrix.fill_diagonal_(False)
-        is_overlapping[:num_hard] = overlap_matrix.any(dim=1)
-        
-        return is_overlapping
-
-    
-    
-    def _propose_batch_moves(self, current_placement: torch.Tensor, 
-                             movable_indices: torch.Tensor, temp: float, prob: float, 
-                             benchmark: Benchmark) -> Tuple[List[int], List[torch.Tensor], int]:
-        """Proposes a batch of moves using random nudging (no legality checks)."""
-        moved_indices, old_positions = [], []
-        attempted_count = 0
-        canvas_size = torch.tensor([benchmark.canvas_width, benchmark.canvas_height])
-
-        for idx_tensor in movable_indices:
-            idx = idx_tensor.item()
-
-            if random.random() < prob:
-                attempted_count += 1
-                old_pos = current_placement[idx].clone()
-                size = benchmark.macro_sizes[idx]
-
-                # Nudge
-                scale = self.step_scale * (temp / self.initial_temp)
-                nudge = (torch.rand(2) - 0.5) * scale * canvas_size
-                half_size = size / 2.0
-                new_pos = torch.clamp(old_pos + nudge, min=half_size, max=canvas_size - half_size)
-
-                # Apply move without overlap legality checks
-                current_placement[idx] = new_pos
-                moved_indices.append(idx)
-                old_positions.append(old_pos)
-
-        return moved_indices, old_positions, attempted_count
-
-    def _evaluate_and_accept_batch(self, current_placement: torch.Tensor, current_cost: float, 
-                                   moved_indices: List[int], old_positions: List[torch.Tensor], 
-                                   temp: float, best_cost: float, best_placement: torch.Tensor, 
-                                   benchmark: Benchmark) -> Tuple[float, float, torch.Tensor]:
-        """Evaluates batch moves and handles coordinates backtracking."""
-        new_cost = self.compute_cost(current_placement, benchmark)
-        delta = new_cost - current_cost
-        
-        if delta < 0 or random.random() < math.exp(-delta / temp):
-            current_cost = new_cost
-            if current_cost < best_cost:
-                best_cost, best_placement = current_cost, current_placement.clone()
-        else:
-            # Backtrack coordinates
-            for idx, pos in zip(moved_indices, old_positions):
-                current_placement[idx] = pos
-                
-        return current_cost, best_cost, best_placement
-
-    def _perform_cooling(self, i: int, temp: float, prob: float, current_cost: float, 
-                         attempted: int, moved: int, illegal: int, total_hard: int) -> Tuple[float, float]:
-        """Applies cooling and prints progress."""
-        if i % self.cool_interval == 0:
-            temp *= self.cooling_rate
-            prob *= self.cooling_rate
-            print(f"  Iter {i}/{self.iterations}: cost={current_cost:.2f}, temp={temp:.4f}, prob={prob:.3f}, "
-                  f"moved={moved}/{attempted}, illegal={illegal}/{total_hard}")
-        return temp, prob
-
-    def compute_cost(self, placement: torch.Tensor, benchmark: Benchmark) -> float:
-        """Calculate total proxy cost (WL + Density + Congestion)."""
-        metrics = estimate_cost(placement, benchmark)
-        return metrics["proxy_cost"]
 
     def place(self, benchmark: Benchmark) -> torch.Tensor:
-        """Simulated annealing with batch moves and distance-based constraints."""
-        torch.manual_seed(42)
-        random.seed(42)
+        torch.manual_seed(self.seed)
+        random.seed(self.seed)
 
-        num_fixed = benchmark.macro_fixed.sum().item()
-        print(f"Benchmark: {benchmark.num_hard_macros} hard, {benchmark.num_soft_macros} soft, {num_fixed} fixed")
-
-        current_placement = benchmark.macro_positions.clone()
-        movable_indices = torch.where(benchmark.get_movable_mask())[0]
-        if len(movable_indices) == 0: return current_placement
-
-        current_cost = self.compute_cost(current_placement, benchmark)
-        best_placement, best_cost = current_placement.clone(), current_cost
-        temp, prob = self.initial_temp, self.initial_prob
+        # Initialize incremental estimator
+        estimator = CostEstimator(benchmark)
         
-        initial_invalid = self._get_overlap_mask(current_placement, benchmark).sum().item()
-        print(f"Starting SA: initial_cost={current_cost:.2f}, prob={prob:.2f}, illegal_hards={initial_invalid}")
+        # Internal objective: ProxyCost + OverlapPenalty
+        overlap_weight = 2000.0
+        pair_penalty = 5.0 # Very aggressive penalty for even a single overlap pair
+        
+        def get_internal_cost(metrics):
+            return (metrics["proxy_cost"] + 
+                    overlap_weight * metrics["hard_overlap_area"] + 
+                    pair_penalty * metrics["overlap_count"])
+
+        current_metrics = estimator.get_costs()
+        current_cost = get_internal_cost(current_metrics)
+        
+        best_placement = benchmark.macro_positions.clone()
+        best_cost = current_cost
+        best_proxy = current_metrics["proxy_cost"]
+        best_overlap = current_metrics["hard_overlap_area"]
+        best_count = current_metrics["overlap_count"]
+        
+        temp = self.initial_temp
+        
+        movable_indices = []
+        for i in range(benchmark.num_hard_macros):
+            if not benchmark.macro_fixed[i]:
+                movable_indices.append(i)
+        
+        if not movable_indices:
+            return benchmark.macro_positions
+
+        print(f"Starting Legalizing Fast SA with {len(movable_indices)} movable macros.")
+        print(f"Initial Proxy: {current_metrics['proxy_cost']:.4f} | Overlap Area: {current_metrics['hard_overlap_area']:.6f} | Count: {current_metrics['overlap_count']}")
 
         for i in range(self.iterations):
-            is_overlapping = self._get_overlap_mask(current_placement, benchmark)
-            num_illegal = is_overlapping.sum().item()
+            idx = random.choice(movable_indices)
+            old_pos = estimator.placement[idx].clone()
             
-            moved_indices, old_positions, attempted = self._propose_batch_moves(
-                current_placement, movable_indices, temp, prob, benchmark
-            )
+            # Dynamic step size
+            scale = 0.1 * (temp / self.initial_temp + 0.01)
+            dx = (random.random() * 2 - 1) * benchmark.canvas_width * scale
+            dy = (random.random() * 2 - 1) * benchmark.canvas_height * scale
             
-            if moved_indices:
-                current_cost, best_cost, best_placement = self._evaluate_and_accept_batch(
-                    current_placement, current_cost, moved_indices, old_positions, 
-                    temp, best_cost, best_placement, benchmark
-                )
+            w, h = benchmark.macro_sizes[idx]
+            new_x = (old_pos[0] + dx).clamp(w/2, benchmark.canvas_width - w/2)
+            new_y = (old_pos[1] + dy).clamp(h/2, benchmark.canvas_height - h/2)
+            new_pos = torch.tensor([new_x, new_y])
             
-            temp, prob = self._perform_cooling(i, temp, prob, current_cost, attempted, len(moved_indices), 
-                                               num_illegal, benchmark.num_hard_macros)
+            # Incremental update
+            estimator.update_macro_pos(idx, new_pos)
+            new_metrics = estimator.get_costs()
+            new_cost = get_internal_cost(new_metrics)
+            
+            delta = new_cost - current_cost
+            
+            # Metropolis Criterion
+            if delta < 0 or (temp > 0 and random.random() < math.exp(-delta / temp)):
+                current_cost = new_cost
+                if current_cost < best_cost:
+                    best_cost = current_cost
+                    best_placement = estimator.placement.clone()
+                    best_proxy = new_metrics["proxy_cost"]
+                    best_overlap = new_metrics["hard_overlap_area"]
+                    best_count = new_metrics["overlap_count"]
+            else:
+                # Reject
+                estimator.update_macro_pos(idx, old_pos)
+            
+            # Cooling
+            temp *= self.cooling_rate
+            
+            if (i + 1) % 100 == 0:
+                print(f"  Iteration {i+1}/{self.iterations} | Proxy: {new_metrics['proxy_cost']:.4f} | Overlap Area: {new_metrics['hard_overlap_area']:.6f} | Count: {new_metrics['overlap_count']} | Temp: {temp:.4f}")
 
-        print(f"SA Finished: best_cost={best_cost:.2f}")
+        print(f"Fast SA Finished. Final Best Proxy: {best_proxy:.4f} | Overlap Area: {best_overlap:.6f} | Count: {best_count}")
         return best_placement
