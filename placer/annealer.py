@@ -12,46 +12,53 @@ import math
 import random
 from macro_place.benchmark import Benchmark
 try:
-    from utils.cost_utils import CostEstimator
+    from utils.cost_utils import CostEstimator, IterativeOverlap
 except ImportError:
     # Fallback for different execution environments
-    from chip_check.utils.cost_utils import CostEstimator
+    from chip_check.utils.cost_utils import CostEstimator, IterativeOverlap
 
 class AnnealerPlacer:
     """
     A fast Simulated Annealing placer using incremental cost updates.
     Optimizes for Wirelength, Density, Congestion, and Legal Placement (overlaps).
     """
-    def __init__(self, seed: int = 42, iterations: int = 20000, initial_temp: float = 1.0, cooling_rate: float = 0.9998):
+    def __init__(self, seed: int = 42, iterations: int = 20000, initial_temp: float = 1.0, cooling_rate: float = 0.99, min_temp: float = 1e-4):
         self.seed = seed
         self.iterations = iterations
         self.initial_temp = initial_temp
         self.cooling_rate = cooling_rate
+        self.min_temp = min_temp
 
     def place(self, benchmark: Benchmark) -> torch.Tensor:
+
         torch.manual_seed(self.seed)
         random.seed(self.seed)
 
-        # Initialize incremental estimator
+        # Initialize incremental trackers
         estimator = CostEstimator(benchmark)
+        overlap_tracker = IterativeOverlap(benchmark, benchmark.macro_positions)
         
-        # Internal objective: ProxyCost + OverlapPenalty
+        # Internal objective weights
         overlap_weight = 2000.0
         pair_penalty = 5.0 # Very aggressive penalty for even a single overlap pair
         
-        def get_internal_cost(metrics):
-            return (metrics["proxy_cost"] + 
-                    overlap_weight * metrics["hard_overlap_area"] + 
-                    pair_penalty * metrics["overlap_count"])
+        def get_internal_cost(proxy, area, count):
+            return (proxy + 
+                    overlap_weight * area + 
+                    pair_penalty * count)
 
         current_metrics = estimator.get_costs()
-        current_cost = get_internal_cost(current_metrics)
+        current_cost = get_internal_cost(
+            current_metrics["proxy_cost"],
+            overlap_tracker.total_overlap_area,
+            overlap_tracker.overlap_count
+        )
         
         best_placement = benchmark.macro_positions.clone()
         best_cost = current_cost
         best_proxy = current_metrics["proxy_cost"]
-        best_overlap = current_metrics["hard_overlap_area"]
-        best_count = current_metrics["overlap_count"]
+        best_overlap = overlap_tracker.total_overlap_area
+        best_count = overlap_tracker.overlap_count
         
         temp = self.initial_temp
         
@@ -64,7 +71,7 @@ class AnnealerPlacer:
             return benchmark.macro_positions
 
         print(f"Starting Legalizing Fast SA with {len(movable_indices)} movable macros.")
-        print(f"Initial Proxy: {current_metrics['proxy_cost']:.4f} | Overlap Area: {current_metrics['hard_overlap_area']:.6f} | Count: {current_metrics['overlap_count']}")
+        print(f"Initial Cost: {current_cost:.4f} | Overlap Area: {overlap_tracker.total_overlap_area:.6f} | Count: {overlap_tracker.overlap_count}")
 
         for i in range(self.iterations):
             idx = random.choice(movable_indices)
@@ -80,10 +87,16 @@ class AnnealerPlacer:
             new_y = (old_pos[1] + dy).clamp(h/2, benchmark.canvas_height - h/2)
             new_pos = torch.tensor([new_x, new_y])
             
-            # Incremental update
+            # Incremental updates
             estimator.update_macro_pos(idx, new_pos)
+            overlap_tracker.update_macro_pos(idx, old_pos, new_pos, estimator.placement)
+            
             new_metrics = estimator.get_costs()
-            new_cost = get_internal_cost(new_metrics)
+            new_cost = get_internal_cost(
+                new_metrics["proxy_cost"],
+                overlap_tracker.total_overlap_area,
+                overlap_tracker.overlap_count
+            )
             
             delta = new_cost - current_cost
             
@@ -94,17 +107,20 @@ class AnnealerPlacer:
                     best_cost = current_cost
                     best_placement = estimator.placement.clone()
                     best_proxy = new_metrics["proxy_cost"]
-                    best_overlap = new_metrics["hard_overlap_area"]
-                    best_count = new_metrics["overlap_count"]
+                    best_overlap = overlap_tracker.total_overlap_area
+                    best_count = overlap_tracker.overlap_count
             else:
                 # Reject
                 estimator.update_macro_pos(idx, old_pos)
+                overlap_tracker.update_macro_pos(idx, new_pos, old_pos, estimator.placement)
             
             # Cooling
-            temp *= self.cooling_rate
-            
-            if (i + 1) % 100 == 0:
-                print(f"  Iteration {i+1}/{self.iterations} | Proxy: {new_metrics['proxy_cost']:.4f} | Overlap Area: {new_metrics['hard_overlap_area']:.6f} | Count: {new_metrics['overlap_count']} | Temp: {temp:.4f}")
+            temp = max(self.min_temp, temp * self.cooling_rate)
+
+            if (i + 1) % 1000 == 0:
+                print(f"  It {i+1}/{self.iterations} | C: {new_cost:.4f} | "
+                      f"OA: {overlap_tracker.total_overlap_area:.6f} | "
+                      f"OC: {overlap_tracker.overlap_count} | T: {temp:.4f}")
 
         print(f"Fast SA Finished. Final Best Proxy: {best_proxy:.4f} | Overlap Area: {best_overlap:.6f} | Count: {best_count}")
         return best_placement

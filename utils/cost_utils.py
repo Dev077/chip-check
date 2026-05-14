@@ -25,6 +25,7 @@ def calculate_hpwl(placement: torch.Tensor, benchmark: Benchmark) -> float:
         x_min, x_max = abs_pins[:, 0].min(), abs_pins[:, 0].max()
         y_min, y_max = abs_pins[:, 1].min(), abs_pins[:, 1].max()
         hpwl = (x_max - x_min) + (y_max - y_min)
+
         weight = benchmark.net_weights[net_idx].item()
         total_hpwl += (hpwl.item() * weight)
     total_connections = benchmark.net_weights.sum().item()
@@ -124,11 +125,126 @@ def calculate_hard_overlap_area(placement: torch.Tensor, benchmark: Benchmark) -
                 overlap_area += (overlap_x * overlap_y).item()
     return overlap_area
 
+def get_per_macro_overlaps(placement: torch.Tensor, benchmark: Benchmark) -> Dict[int, float]:
+    """
+    Calculate the total overlap area for each hard macro.
+    Returns a dictionary mapping macro index to its total overlap area.
+    Only includes movable hard macros unless all are movable.
+    """
+    num_hard = benchmark.num_hard_macros
+    if num_hard == 0:
+        return {}
+
+    all_pos = placement[:num_hard]
+    all_sizes = benchmark.macro_sizes[:num_hard]
+
+    # Vectorized all-to-all overlap calculation
+    # dist[i, j] = |p_i - p_j|
+    dist_x = torch.abs(all_pos[:, 0].unsqueeze(1) - all_pos[:, 0].unsqueeze(0))
+    dist_y = torch.abs(all_pos[:, 1].unsqueeze(1) - all_pos[:, 1].unsqueeze(0))
+
+    # min_sep[i, j] = (s_i + s_j) / 2
+    min_sep_x = (all_sizes[:, 0].unsqueeze(1) + all_sizes[:, 0].unsqueeze(0)) / 2.0
+    min_sep_y = (all_sizes[:, 1].unsqueeze(1) + all_sizes[:, 1].unsqueeze(0)) / 2.0
+
+    ov_x = torch.clamp(min_sep_x - dist_x, min=0.0)
+    ov_y = torch.clamp(min_sep_y - dist_y, min=0.0)
+
+    # area[i, j] is the overlap between i and j
+    areas = ov_x * ov_y
+    areas.fill_diagonal_(0.0) # No self-overlap
+
+    per_macro_area = areas.sum(dim=1)
+
+    # Determine which to return
+    fixed_mask = benchmark.macro_fixed[:num_hard]
+    all_movable = not fixed_mask.any()
+
+    result = {}
+    for i in range(num_hard):
+        if all_movable or not fixed_mask[i]:
+            result[i] = per_macro_area[i].item()
+
+    return result
+
+class IterativeOverlap:
+    """
+    Encapsulates incremental overlap logic for hard macros.
+    Tracks:
+    - total_overlap_area
+    - overlap_count (number of pairs)
+    - macro_overlaps (area per macro)
+    """
+    def __init__(self, benchmark: Benchmark, placement: torch.Tensor):
+        self.benchmark = benchmark
+        self.num_hard = benchmark.num_hard_macros
+        self.macro_sizes = benchmark.macro_sizes[:self.num_hard]
+        self.total_overlap_area = 0.0
+        self.overlap_count = 0
+        self.macro_overlaps = torch.zeros(self.num_hard)
+        
+        if self.num_hard > 0:
+            all_pos = placement[:self.num_hard]
+            # dist[i, j] = |p_i - p_j|
+            dist_x = torch.abs(all_pos[:, 0].unsqueeze(1) - all_pos[:, 0].unsqueeze(0))
+            dist_y = torch.abs(all_pos[:, 1].unsqueeze(1) - all_pos[:, 1].unsqueeze(0))
+
+            min_sep_x = (self.macro_sizes[:, 0].unsqueeze(1) + self.macro_sizes[:, 0].unsqueeze(0)) / 2.0
+            min_sep_y = (self.macro_sizes[:, 1].unsqueeze(1) + self.macro_sizes[:, 1].unsqueeze(0)) / 2.0
+
+            ov_x = torch.clamp(min_sep_x - dist_x, min=0.0)
+            ov_y = torch.clamp(min_sep_y - dist_y, min=0.0)
+
+            areas = ov_x * ov_y
+            areas.fill_diagonal_(0.0)
+            
+            self.macro_overlaps = areas.sum(dim=1)
+            self.total_overlap_area = self.macro_overlaps.sum().item() / 2.0
+            self.overlap_count = (areas > 0).sum().item() // 2
+
+    def update_macro_pos(self, macro_idx: int, old_pos: torch.Tensor, new_pos: torch.Tensor, all_pos: torch.Tensor):
+        if macro_idx >= self.num_hard:
+            return
+
+        # Vectorized overlap check
+        # old_ovs
+        dx_old = torch.abs(old_pos[0] - all_pos[:self.num_hard, 0])
+        dy_old = torch.abs(old_pos[1] - all_pos[:self.num_hard, 1])
+        min_sep_x = (self.macro_sizes[macro_idx, 0] + self.macro_sizes[:, 0]) / 2.0
+        min_sep_y = (self.macro_sizes[macro_idx, 1] + self.macro_sizes[:, 1]) / 2.0
+
+        overlap_x_old = torch.clamp(min_sep_x - dx_old, min=0.0)
+        overlap_y_old = torch.clamp(min_sep_y - dy_old, min=0.0)
+        old_ovs = overlap_x_old * overlap_y_old
+        old_ovs[macro_idx] = 0.0
+
+        # new_ovs
+        dx_new = torch.abs(new_pos[0] - all_pos[:self.num_hard, 0])
+        dy_new = torch.abs(new_pos[1] - all_pos[:self.num_hard, 1])
+        overlap_x_new = torch.clamp(min_sep_x - dx_new, min=0.0)
+        overlap_y_new = torch.clamp(min_sep_y - dy_new, min=0.0)
+        new_ovs = overlap_x_new * overlap_y_new
+        new_ovs[macro_idx] = 0.0
+
+        diff_ovs = new_ovs - old_ovs
+        
+        # Update other macros' overlap with the moved macro
+        self.macro_overlaps += diff_ovs
+        # Update the moved macro's total overlap area
+        self.macro_overlaps[macro_idx] = new_ovs.sum()
+        
+        # Update total overlap area (sum of all unique pairs)
+        self.total_overlap_area += diff_ovs.sum().item()
+
+        old_mask = old_ovs > 0
+        new_mask = new_ovs > 0
+        self.overlap_count += (new_mask.sum() - old_mask.sum()).item()
+
 class CostEstimator:
     """
     Incremental cost estimator for macro placement.
     Performs initial full calculation and then provides fast updates for single macro moves.
-    Matches Ground Truth proxy cost + extra legality metrics.
+    Matches Ground Truth proxy cost: 1.0*WL + 0.5*Density + 0.5*Congestion
     """
     def __init__(self, benchmark: Benchmark, weights: Optional[Dict[str, float]] = None):
         self.benchmark = benchmark
@@ -176,17 +292,6 @@ class CostEstimator:
         self.congestion_grid = torch.zeros((self.rows, self.cols))
         for i in range(self.benchmark.num_nets):
             self._update_congestion_grid(i, 1.0)
-            
-        # 4. Overlaps (HARD macros only)
-        self.total_overlap_area = 0.0
-        self.overlap_count = 0
-        num_hard = self.benchmark.num_hard_macros
-        for i in range(num_hard):
-            for j in range(i + 1, num_hard):
-                ov = self._calculate_pair_overlap(i, j, self.placement[i], self.placement[j])
-                if ov > 0:
-                    self.total_overlap_area += ov
-                    self.overlap_count += 1
 
     def _calculate_net_hpwl(self, net_idx: int) -> float:
         net_pins = self.benchmark.net_pin_nodes[net_idx]
@@ -238,15 +343,6 @@ class CostEstimator:
                     cell_demand = demand_density * (inter_w * inter_h)
                     self.congestion_grid[r, c] += sign * (cell_demand / (avg_cap + 1e-6))
 
-    def _calculate_pair_overlap(self, i: int, j: int, pos_i: torch.Tensor, pos_j: torch.Tensor) -> float:
-        dx = abs(pos_i[0] - pos_j[0])
-        dy = abs(pos_i[1] - pos_j[1])
-        min_sep_x = (self.benchmark.macro_sizes[i, 0] + self.benchmark.macro_sizes[j, 0]) / 2.0
-        min_sep_y = (self.benchmark.macro_sizes[i, 1] + self.benchmark.macro_sizes[j, 1]) / 2.0
-        overlap_x = max(0.0, min_sep_x - dx)
-        overlap_y = max(0.0, min_sep_y - dy)
-        return (overlap_x * overlap_y).item() if overlap_x > 0 and overlap_y > 0 else 0.0
-
     def update_macro_pos(self, macro_idx: int, new_pos: torch.Tensor):
         """Incrementally update costs for a single macro move."""
         old_pos = self.placement[macro_idx].clone()
@@ -255,43 +351,7 @@ class CostEstimator:
         self._update_density_grid(macro_idx, old_pos, -1.0)
         self._update_density_grid(macro_idx, new_pos, 1.0)
 
-        # 2. Update Overlaps (Vectorized for HARD macros)
-        if macro_idx < self.benchmark.num_hard_macros:
-            num_hard = self.benchmark.num_hard_macros
-            # Get dimensions for all macros
-            all_pos = self.placement[:num_hard]
-            all_sizes = self.benchmark.macro_sizes[:num_hard]
-
-            # Vectorized overlap check
-            # old_ovs
-            dx_old = torch.abs(old_pos[0] - all_pos[:, 0])
-            dy_old = torch.abs(old_pos[1] - all_pos[:, 1])
-            min_sep_x = (self.benchmark.macro_sizes[macro_idx, 0] + all_sizes[:, 0]) / 2.0
-            min_sep_y = (self.benchmark.macro_sizes[macro_idx, 1] + all_sizes[:, 1]) / 2.0
-
-            overlap_x_old = torch.clamp(min_sep_x - dx_old, min=0.0)
-            overlap_y_old = torch.clamp(min_sep_y - dy_old, min=0.0)
-            old_ovs = overlap_x_old * overlap_y_old
-            old_ovs[macro_idx] = 0.0 # Don't count self-overlap
-
-            # new_ovs
-            dx_new = torch.abs(new_pos[0] - all_pos[:, 0])
-            dy_new = torch.abs(new_pos[1] - all_pos[:, 1])
-            overlap_x_new = torch.clamp(min_sep_x - dx_new, min=0.0)
-            overlap_y_new = torch.clamp(min_sep_y - dy_new, min=0.0)
-            new_ovs = overlap_x_new * overlap_y_new
-            new_ovs[macro_idx] = 0.0
-
-            self.total_overlap_area += (new_ovs.sum() - old_ovs.sum()).item()
-
-            # Update overlap count
-            old_mask = old_ovs > 0
-            new_mask = new_ovs > 0
-            self.overlap_count += (new_mask.sum() - old_mask.sum()).item()
-
-
-
-        # 3. Update HPWL and Congestion Grid
+        # 2. Update HPWL and Congestion Grid
         self.placement[macro_idx] = new_pos
         self.all_owner_pos[macro_idx] = old_pos # Restore for subtraction
         for net_idx in self.macro_to_nets[macro_idx]:
@@ -331,8 +391,6 @@ class CostEstimator:
             "wirelength_cost": wl_cost,
             "density_cost": den_cost,
             "congestion_cost": cong_cost,
-            "hard_overlap_area": self.total_overlap_area,
-            "overlap_count": self.overlap_count
         }
 
 if __name__ == "__main__":
@@ -384,4 +442,4 @@ if __name__ == "__main__":
             inc_val = inc_metrics[k]
             print(f"{k:20}: Full={full_val:.6f}, Inc={inc_val:.6f}, Delta={inc_val - full_val:+.6f}")
         
-        print(f"hard_overlap_area    : Inc={inc_metrics['hard_overlap_area']:.6f}")
+        print(f"hard_overlap_area    : Inc={inc_metrics.get('hard_overlap_area', 0.0):.6f}")
