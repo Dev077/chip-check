@@ -1,0 +1,40 @@
+FROM nvcr.io/nvidia/pytorch:21.10-py3
+LABEL maintainer="haoxingr@nvidia.com"
+
+# update torch
+RUN pip install --upgrade pip 
+RUN pip install torch==1.10.0+cu113 torchvision==0.11.1+cu113 torchaudio===0.10.0+cu113  -f https://download.pytorch.org/whl/cu113/torch_stable.html
+
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+        && apt-get install -y \
+            wget \
+            flex \
+            libcairo2-dev \
+            libboost-all-dev \
+            bison \
+            git
+
+# install cmake
+ADD https://cmake.org/files/v3.21/cmake-3.21.0-linux-x86_64.sh /cmake-3.21.0-linux-x86_64.sh
+RUN mkdir /opt/cmake \
+        && sh /cmake-3.21.0-linux-x86_64.sh --prefix=/opt/cmake --skip-license \
+        && rm /cmake-3.21.0-linux-x86_64.sh
+
+ENV PATH="/opt/cmake/bin:${PATH}"
+
+# Clone AutoDMP using HTTPS (no SSH keys needed)
+RUN git clone --recursive https://github.com/nvlabs/AutoDMP.git /AutoDMP
+
+WORKDIR /AutoDMP
+
+# Install dependencies
+RUN pip install hpbandster ConfigSpace
+
+# Build AutoDMP
+ARG MAKE_JOBS=4
+RUN cd /AutoDMP && mkdir build && cd build && \
+    cmake -DCMAKE_BUILD_TYPE=Release .. && \
+    make -j ${MAKE_JOBS}
+
+ENV PYTHONPATH="/AutoDMP"
