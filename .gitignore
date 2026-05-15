@@ -74,11 +74,7 @@ temp/
 *.tmp
 # MacroPlacement evaluator (submodule)
 # Keep the submodule but ignore unnecessary files
-external/MacroPlacement/Testcases/
-external/MacroPlacement/ExperimentalData/
-external/MacroPlacement/Docs/OurProgress/
-external/MacroPlacement/Flows/
-external/MacroPlacement/.git/
+external/
 
 # Internal dev tooling (not for participants)
 scripts/test_*.py
