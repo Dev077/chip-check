@@ -404,6 +404,7 @@ if __name__ == "__main__":
     benchmark_dir = "external/MacroPlacement/Testcases/ICCAD04/ibm01"
     
     if os.path.exists(benchmark_dir):
+        from tqdm import tqdm
         benchmark, plc = load_benchmark_from_dir(benchmark_dir)
         
         print(f"Syncing net weights and starting {TRIALS} random trials...")
@@ -415,7 +416,7 @@ if __name__ == "__main__":
         my_results = []
         gt_results = []
         
-        for t in range(TRIALS):
+        for t in tqdm(range(TRIALS), desc="Evaluating Trials"):
             # Randomize movable macros
             placement = benchmark.macro_positions.clone()
             for i in range(benchmark.num_hard_macros):
@@ -439,7 +440,6 @@ if __name__ == "__main__":
                 gt_metrics["congestion_cost"],
                 gt_metrics["proxy_cost"]
             ])
-            print(f"Trial {t+1:2}: My Proxy={my_results[-1][3]:.4f}, GT Proxy={gt_results[-1][3]:.4f}")
 
         my_data = np.array(my_results)
         gt_data = np.array(gt_results)
