@@ -395,51 +395,100 @@ class CostEstimator:
 
 if __name__ == "__main__":
     import os
+    import numpy as np
+    import matplotlib.pyplot as plt
     from macro_place.loader import load_benchmark_from_dir
     from macro_place.objective import compute_proxy_cost
     
+    TRIALS = 100
     benchmark_dir = "external/MacroPlacement/Testcases/ICCAD04/ibm01"
     
     if os.path.exists(benchmark_dir):
         benchmark, plc = load_benchmark_from_dir(benchmark_dir)
         
-        print("Syncing net weights from PLC to Benchmark for validation...")
+        print(f"Syncing net weights and starting {TRIALS} random trials...")
         for i, (driver, sinks) in enumerate(plc.nets.items()):
             driver_idx = plc.mod_name_to_indices.get(driver)
             if driver_idx is not None:
                 benchmark.net_weights[i] = float(plc.modules_w_pins[driver_idx].get_weight())
         
-        print("\n--- Initial Cost Verification ---")
-        estimator = CostEstimator(benchmark)
-        gt_metrics = compute_proxy_cost(benchmark.macro_positions, benchmark, plc)
-        pt_metrics = estimator.get_costs()
+        my_results = []
+        gt_results = []
         
-        for k in pt_metrics.keys():
-            # Map PT keys to GT keys if necessary
-            gt_key = k
-            if k == "hard_overlap_area": gt_key = "total_overlap_area"
+        for t in range(TRIALS):
+            # Randomize movable macros
+            placement = benchmark.macro_positions.clone()
+            for i in range(benchmark.num_hard_macros):
+                if not benchmark.macro_fixed[i]:
+                    w, h = benchmark.macro_sizes[i]
+                    placement[i, 0] = torch.rand(1).item() * (benchmark.canvas_width - w) + w/2
+                    placement[i, 1] = torch.rand(1).item() * (benchmark.canvas_height - h) + h/2
             
-            gt_val = gt_metrics.get(gt_key, 0.0)
-            pt_val = pt_metrics[k]
-            print(f"{k:20}: GT={gt_val:.6f}, PT={pt_val:.6f}, Delta={pt_val - gt_val:+.6f}")
+            my_metrics = estimate_cost(placement, benchmark)
+            gt_metrics = compute_proxy_cost(placement, benchmark, plc)
+            
+            my_results.append([
+                my_metrics["wirelength_cost"],
+                my_metrics["density_cost"],
+                my_metrics["congestion_cost"],
+                my_metrics["proxy_cost"]
+            ])
+            gt_results.append([
+                gt_metrics["wirelength_cost"],
+                gt_metrics["density_cost"],
+                gt_metrics["congestion_cost"],
+                gt_metrics["proxy_cost"]
+            ])
+            print(f"Trial {t+1:2}: My Proxy={my_results[-1][3]:.4f}, GT Proxy={gt_results[-1][3]:.4f}")
+
+        my_data = np.array(my_results)
+        gt_data = np.array(gt_results)
         
-        print("\n--- Incremental Update Verification (Moving macro 0) ---")
-        macro_idx = 0
-        new_pos = benchmark.macro_positions[macro_idx] + torch.tensor([10.0, 10.0])
+        errors = np.abs(my_data - gt_data) / (gt_data + 1e-9) * 100
+        avg_errors = np.mean(errors, axis=0)
         
-        # 1. Full recalculation on new placement
-        new_placement = benchmark.macro_positions.clone()
-        new_placement[macro_idx] = new_pos
-        full_metrics = estimate_cost(new_placement, benchmark)
+        # Pearson correlation for each column
+        correlations = [np.corrcoef(my_data[:, i], gt_data[:, i])[0, 1] for i in range(4)]
         
-        # 2. Incremental update
-        estimator.update_macro_pos(macro_idx, new_pos)
-        inc_metrics = estimator.get_costs()
+        terms = ["Wirelength", "Density", "Congestion", "Proxy Total"]
+        print("\n--- Accuracy Analysis (My Estimate vs Ground Truth) ---")
+        print(f"{'Term':<15} | {'Avg Error %':<12} | {'Correlation':<12}")
+        print("-" * 45)
+        for i, term in enumerate(terms):
+            print(f"{term:<15} | {avg_errors[i]:>10.2f}% | {correlations[i]:>11.4f}")
+
+        # Visualization
+        os.makedirs("vis", exist_ok=True)
+        plt.figure(figsize=(12, 5))
         
-        for k in inc_metrics.keys():
-            if k == "hard_overlap_area": continue
-            full_val = full_metrics[k]
-            inc_val = inc_metrics[k]
-            print(f"{k:20}: Full={full_val:.6f}, Inc={inc_val:.6f}, Delta={inc_val - full_val:+.6f}")
+        # Helper for regression line
+        def plot_regression(x, y, color, label_prefix):
+            m, b = np.polyfit(x, y, 1)
+            x_range = np.array([x.min(), x.max()])
+            plt.plot(x_range, m * x_range + b, color=color, linestyle='-', linewidth=2, 
+                     label=f"Fit: y={m:.2f}x+{b:.2f}")
+            return m, b
+
+        # Congestion Scatter
+        plt.subplot(1, 2, 1)
+        plt.scatter(gt_data[:, 2], my_data[:, 2], alpha=0.7, edgecolors='k', label="Data")
+        plot_regression(gt_data[:, 2], my_data[:, 2], 'red', "Congestion")
+        plt.xlabel("Ground Truth Congestion")
+        plt.ylabel("Estimated Congestion")
+        plt.title(f"Congestion (Corr: {correlations[2]:.3f})")
+        plt.legend()
+        plt.grid(True, linestyle=':', alpha=0.6)
         
-        print(f"hard_overlap_area    : Inc={inc_metrics.get('hard_overlap_area', 0.0):.6f}")
+        # Proxy Total Scatter
+        plt.subplot(1, 2, 2)
+        plt.scatter(gt_data[:, 3], my_data[:, 3], alpha=0.7, edgecolors='k', color='green', label="Data")
+        plot_regression(gt_data[:, 3], my_data[:, 3], 'blue', "Proxy")
+        plt.xlabel("Ground Truth Proxy Total")
+        plt.ylabel("Estimated Proxy Total")
+        plt.title(f"Proxy Total (Corr: {correlations[3]:.3f})")
+        plt.legend()
+        plt.grid(True, linestyle=':', alpha=0.6)
+        
+        plt.tight_layout()
+        plt.savefig("vis/cost_correlation.png")
+        print("\nScatter plots (with regression) saved to vis/cost_correlation.png")
