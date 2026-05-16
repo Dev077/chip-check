@@ -1,95 +1,117 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.fft
 from typing import List, Tuple, Optional
 from macro_place.benchmark import Benchmark
 
 class DreamPlacer:
     """
-    An analytical placer inspired by DREAMPlace.
-    Uses differentiable Weighted-Average (WA) wirelength and a grid-based density potential.
-    Optimizes using gradient descent (Adam).
+    A high-fidelity analytical placer inspired by DREAMPlace.
+    Uses:
+    1. Differentiable WA Wirelength.
+    2. Poisson-based Global Density Potential via FFT.
+    3. Per-iteration Gradient Normalization.
     """
 
     def __init__(
         self,
-        iterations: int = 200,
-        lr: float = 1e-1,
+        iterations: int = 500,
+        lr: float = 1.0,
         gamma: float = 10.0,
         init_density_weight: float = 0.1,
-        max_density_weight: float = 2.0,
-        soft_density_weight: float = 0.1,
+        max_density_weight: float = 10.0,
+        soft_density_weight: float = 0.01,
         grid_size: int = 128,
         seed: int = 42
     ):
         self.iterations = iterations
         self.lr = lr
-        self.gamma = gamma  # Smoothing parameter for WA wirelength
+        self.gamma = gamma
         self.init_density_weight = init_density_weight
         self.max_density_weight = max_density_weight
         self.soft_density_weight = soft_density_weight
         self.grid_size = grid_size
         self.seed = seed
+        
+        # Precompute frequency coefficients for Poisson solver
+        self.w_inv = None
 
+    def _init_poisson_coefficients(self, device):
+        """Precompute 1/(kx^2 + ky^2) for the FFT-based Poisson solver."""
+        M, N = self.grid_size, self.grid_size
+        
+        # Frequency indices
+        u = torch.arange(M, device=device).float()
+        v = torch.arange(N // 2 + 1, device=device).float() # for rfft2
+        
+        # For DCT-like behavior or periodic FFT, these are the eigenvalues of the Laplacian
+        # Using the standard FFT approach:
+        u = torch.where(u > M/2, u - M, u)
+        v = torch.where(v > N/2, v - N, v) # Though rfft2 only has half v
+        
+        # k^2 = (2*pi*u/M)^2 + (2*pi*v/N)^2
+        # We use the discrete version: 2 - 2*cos(2*pi*u/M)
+        cos_u = torch.cos(2 * torch.pi * u / M)
+        cos_v = torch.cos(2 * torch.pi * v / N)
+        
+        # Laplacian in freq domain: lambda = (2 - 2*cos_u) + (2 - 2*cos_v)
+        # We add 1e-6 to avoid div by zero at (0,0)
+        self.w_inv = 1.0 / ((2 - 2*cos_u).unsqueeze(1) + (2 - 2*cos_v).unsqueeze(0) + 1e-8)
+        self.w_inv[0, 0] = 0.0 # Zero out DC component
 
     def place(self, benchmark: Benchmark) -> torch.Tensor:
         torch.manual_seed(self.seed)
-        
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
+        if self.w_inv is None:
+            self._init_poisson_coefficients(device)
+
         # 1. Prepare data
         num_macros = benchmark.num_macros
         canvas_w = benchmark.canvas_width
         canvas_h = benchmark.canvas_height
         
-        # Initialize positions as parameters (only movable ones)
         pos = benchmark.macro_positions.clone().to(device).detach()
         movable_mask = ~benchmark.macro_fixed.to(device)
-        
-        # Optimization variable: only movable macro positions
         movable_pos = pos[movable_mask].clone().detach().requires_grad_(True)
         
+        # Use Adam but with smaller lr if normalization is working
         optimizer = optim.Adam([movable_pos], lr=self.lr)
         
-        # Pre-process nets and pin offsets for device
         net_pin_nodes = [net.to(device) for net in benchmark.net_pin_nodes]
         macro_pin_offsets = [off.to(device) for off in benchmark.macro_pin_offsets]
         port_positions = benchmark.port_positions.to(device)
         macro_sizes = benchmark.macro_sizes.to(device)
         net_weights = benchmark.net_weights.to(device)
         
-        print(f"Starting DREAMPlace-style optimization on {device}")
+        print(f"Starting Poisson DREAMPlace optimization on {device}")
         
-        # 2. Optimization Loop
         for i in range(self.iterations):
             optimizer.zero_grad()
             
-            # Reconstruct full placement
+            # Current placement
             current_pos = pos.clone()
             current_pos[movable_mask] = movable_pos
             
-            # Loss 1: Wirelength (WA)
+            # Loss 1: Wirelength
             wl_loss = self._compute_wa_wirelength(current_pos, benchmark, net_pin_nodes, macro_pin_offsets, port_positions, net_weights, device)
             
-            # Loss 2: Density (Split into Hard and Soft)
-            # Hard macros: Indices [0, num_hard_macros)
-            # Soft macros: Indices [num_hard_macros, num_macros)
-            
-            # Hard Macro Density - Targeting 100% occupancy to prevent overlaps
+            # Loss 2: Poisson Density (Hard Macros)
             hard_mask = torch.arange(num_macros, device=device) < benchmark.num_hard_macros
-            hard_density_loss = self._compute_density_potential(
+            hard_density_loss = self._compute_poisson_density(
                 current_pos[hard_mask], 
                 macro_sizes[hard_mask], 
                 canvas_w, canvas_h, device,
-                target_density=1.0 # Strict target for legalization
+                target_density=1.0 
             )
             
-            # Soft Macro Density - Targeting global average to keep them spread but flexible
+            # Loss 3: Soft Density (Global Spreading)
             soft_mask = ~hard_mask
             if soft_mask.any():
                 total_soft_area = (macro_sizes[soft_mask, 0] * macro_sizes[soft_mask, 1]).sum()
                 soft_target = (total_soft_area / (canvas_w * canvas_h)).item()
-                soft_density_loss = self._compute_density_potential(
+                soft_density_loss = self._compute_poisson_density(
                     current_pos[soft_mask],
                     macro_sizes[soft_mask],
                     canvas_w, canvas_h, device,
@@ -98,111 +120,109 @@ class DreamPlacer:
             else:
                 soft_density_loss = torch.tensor(0.0, device=device)
             
-            # Total Loss
-            # Ramping weight only applies to the "illegal" hard macro overlaps
+            # --- Gradient Normalization (The Critical Step) ---
+            # 1. Backprop components separately to get their individual gradients
+            wl_loss.backward(retain_graph=True)
+            wl_grad = movable_pos.grad.clone()
+            optimizer.zero_grad()
+            
+            hard_density_loss.backward(retain_graph=True)
+            den_grad = movable_pos.grad.clone()
+            optimizer.zero_grad()
+            
+            # 2. Compute Norms
+            wl_norm = torch.norm(wl_grad) + 1e-8
+            den_norm = torch.norm(den_grad) + 1e-8
+            
+            # 3. Dynamic Weighting
+            # We want |Density Gradient| = cur_weight * |WL Gradient|
             progress = i / max(1, self.iterations - 1)
-            cur_hard_weight = self.init_density_weight + (self.max_density_weight - self.init_density_weight) * progress
+            target_weight = self.init_density_weight + (self.max_density_weight - self.init_density_weight) * progress
             
-            total_loss = wl_loss + (cur_hard_weight * hard_density_loss) + (self.soft_density_weight * soft_density_loss)
+            # Scaling factor to make gradients comparable
+            lambda_den = (wl_norm / den_norm) * target_weight
             
+            # Combined Loss
+            total_loss = wl_loss + (lambda_den * hard_density_loss) + (self.soft_density_weight * soft_density_loss)
+            
+            # Final backprop
             total_loss.backward()
             optimizer.step()
             
-            # Post-step: Keep macros within canvas
+            # Post-step clamping
             with torch.no_grad():
-                idx_movable = 0
-                for macro_idx in range(num_macros):
-                    if movable_mask[macro_idx]:
-                        w, h = macro_sizes[macro_idx]
-                        movable_pos.data[idx_movable, 0].clamp_(w/2, canvas_w - w/2)
-                        movable_pos.data[idx_movable, 1].clamp_(h/2, canvas_h - h/2)
-                        idx_movable += 1
+                idx_m = 0
+                for m_idx in range(num_macros):
+                    if movable_mask[m_idx]:
+                        w, h = macro_sizes[m_idx]
+                        movable_pos.data[idx_m, 0].clamp_(w/2, canvas_w - w/2)
+                        movable_pos.data[idx_m, 1].clamp_(h/2, canvas_h - h/2)
+                        idx_m += 1
 
             if (i + 1) % 10 == 0:
-                print(f"  Iteration {i+1:3d}/{self.iterations} | WL: {wl_loss.item():.6f} | HardDen: {hard_density_loss.item():.6f} (x{cur_hard_weight:.2f}) | SoftDen: {soft_density_loss.item():.6f} (x{self.soft_density_weight:.2f}) | Total: {total_loss.item():.6f}")
+                print(f"  Iteration {i+1:3d} | WL: {wl_loss.item():.4f} | HardDen: {hard_density_loss.item():.4f} | L_Den: {lambda_den:.2f} | Total: {total_loss.item():.4f}")
 
-        # Final placement
         final_pos = pos.clone()
         final_pos[movable_mask] = movable_pos.detach()
         return final_pos.cpu()
 
-    def _compute_wa_wirelength(self, pos: torch.Tensor, benchmark: Benchmark, net_pin_nodes, macro_pin_offsets, port_positions, net_weights, device) -> torch.Tensor:
-        """Differentiable Weighted-Average (WA) wirelength."""
+    def _compute_wa_wirelength(self, pos, benchmark, net_pin_nodes, macro_pin_offsets, port_positions, net_weights, device):
         total_wa = torch.tensor(0.0, device=device)
         all_owner_pos = torch.cat([pos, port_positions], dim=0)
-        
-        # Optimization: Loop over nets. 
-        # For large benchmarks, this should be vectorized with padding or scatter.
         for net_idx, net_pins in enumerate(net_pin_nodes):
             owner_idx = net_pins[:, 0]
             pin_idx = net_pins[:, 1]
-            base_pos = all_owner_pos[owner_idx]
-            
-            # Add pin offsets
-            pins_abs = base_pos.clone()
-            # Hard macro offsets
+            pins_abs = all_owner_pos[owner_idx].clone()
             hard_macro_mask = owner_idx < benchmark.num_hard_macros
             if hard_macro_mask.any():
-                for pin_in_net_idx in torch.where(hard_macro_mask)[0]:
-                    o_idx = owner_idx[pin_in_net_idx].item()
-                    p_idx = pin_idx[pin_in_net_idx].item()
-                    pins_abs[pin_in_net_idx] = pins_abs[pin_in_net_idx] + macro_pin_offsets[o_idx][p_idx]
-            
-            net_wa = self._wa_1d(pins_abs[:, 0]) + self._wa_1d(pins_abs[:, 1])
-            total_wa = total_wa + net_wa * net_weights[net_idx]
-            
-        total_connections = net_weights.sum().item()
-        norm_factor = (benchmark.canvas_width + benchmark.canvas_height) * total_connections
-        return total_wa / norm_factor if norm_factor != 0 else total_wa
+                for idx in torch.where(hard_macro_mask)[0]:
+                    o_idx = owner_idx[idx].item()
+                    p_idx = pin_idx[idx].item()
+                    pins_abs[idx] = pins_abs[idx] + macro_pin_offsets[o_idx][p_idx]
+            total_wa = total_wa + (self._wa_1d(pins_abs[:, 0]) + self._wa_1d(pins_abs[:, 1])) * net_weights[net_idx]
+        return total_wa / ((benchmark.canvas_width + benchmark.canvas_height) * net_weights.sum() + 1e-8)
 
-    def _wa_1d(self, x: torch.Tensor) -> torch.Tensor:
-        """1D WA wirelength for a single net."""
+    def _wa_1d(self, x):
         if x.size(0) <= 1: return torch.tensor(0.0, device=x.device)
-        
-        # Max/Min for numerical stability
-        x_max = torch.max(x)
-        x_min = torch.min(x)
-        
+        x_max, x_min = torch.max(x), torch.min(x)
         exp_u = torch.exp((x - x_max) / self.gamma)
-        sum_exp_u = torch.sum(exp_u)
-        wa_u = torch.sum(x * exp_u) / (sum_exp_u + 1e-6)
-        
         exp_l = torch.exp((x_min - x) / self.gamma)
-        sum_exp_l = torch.sum(exp_l)
-        wa_l = torch.sum(x * exp_l) / (sum_exp_l + 1e-6)
-        
+        wa_u = torch.sum(x * exp_u) / (torch.sum(exp_u) + 1e-6)
+        wa_l = torch.sum(x * exp_l) / (torch.sum(exp_l) + 1e-6)
         return wa_u - wa_l
 
-    def _compute_density_potential(self, pos: torch.Tensor, sizes: torch.Tensor, canvas_w: float, canvas_h: float, device, target_density: float = 1.0) -> torch.Tensor:
-        """Differentiable grid-based density potential for a subset of macros."""
-        if pos.size(0) == 0:
-            return torch.tensor(0.0, device=device)
-            
+    def _compute_poisson_density(self, pos, sizes, canvas_w, canvas_h, device, target_density):
+        if pos.size(0) == 0: return torch.tensor(0.0, device=device)
+        
         grid_size = self.grid_size
         cell_w, cell_h = canvas_w / grid_size, canvas_h / grid_size
         
-        # Grid coordinates
+        # 1. Differentiable Rasterization (Smooth Mapping)
         grid_x = torch.linspace(cell_w/2, canvas_w - cell_w/2, grid_size, device=device)
         grid_y = torch.linspace(cell_h/2, canvas_h - cell_h/2, grid_size, device=device)
         
-        macro_x, macro_y = pos[:, 0], pos[:, 1]
-        macro_w, macro_h = sizes[:, 0], sizes[:, 1]
-        
         def get_weights(c, s, g, cs):
-            # c: [N], s: [N], g: [G], cs: float
             dist = torch.abs(g.unsqueeze(0) - c.unsqueeze(1))
-            # Use a Gaussian kernel as a smooth approximation of a box
             sigma = s.unsqueeze(1) * 0.5 + cs * 0.5
             weight = torch.exp(-0.5 * (dist / sigma)**2)
             return weight / (weight.sum(dim=1, keepdim=True) + 1e-6)
 
-        wx = get_weights(macro_x, macro_w, grid_x, cell_w)
-        wy = get_weights(macro_y, macro_h, grid_y, cell_h)
+        wx = get_weights(pos[:, 0], sizes[:, 0], grid_x, cell_w)
+        wy = get_weights(pos[:, 1], sizes[:, 1], grid_y, cell_h)
+        density = torch.matmul(wx.t(), wy * (sizes[:, 0] * sizes[:, 1]).unsqueeze(1)) / (cell_w * cell_h)
         
-        areas = (macro_w * macro_h).unsqueeze(1)
-        density = torch.matmul(wx.t(), wy * areas)
+        # 2. Poisson Solver via FFT
+        # rho = density - target
+        rho = density - target_density
         
-        density_norm = density / (cell_w * cell_h)
+        # FFT to frequency domain
+        rho_hat = torch.fft.rfft2(rho)
         
-        # Penalty for exceeding target occupancy
-        return torch.mean((density_norm - target_density).clamp(min=0)**2)
+        # Energy = \sum |rho_hat|^2 / k^2
+        # This is equivalent to \sum Potential * rho in spatial domain
+        energy = torch.sum(torch.abs(rho_hat)**2 * self.w_inv)
+        
+        return energy
+
+if __name__ == "__main__":
+    print("Poisson DreamPlacer ready.")
