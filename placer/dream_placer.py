@@ -16,8 +16,9 @@ class DreamPlacer:
         iterations: int = 200,
         lr: float = 1e-1,
         gamma: float = 10.0,
-        init_density_weight: float = 1,
+        init_density_weight: float = 0.1,
         max_density_weight: float = 2.0,
+        soft_density_weight: float = 0.1,
         grid_size: int = 128,
         seed: int = 42
     ):
@@ -26,8 +27,10 @@ class DreamPlacer:
         self.gamma = gamma  # Smoothing parameter for WA wirelength
         self.init_density_weight = init_density_weight
         self.max_density_weight = max_density_weight
+        self.soft_density_weight = soft_density_weight
         self.grid_size = grid_size
         self.seed = seed
+
 
     def place(self, benchmark: Benchmark) -> torch.Tensor:
         torch.manual_seed(self.seed)
@@ -100,10 +103,7 @@ class DreamPlacer:
             progress = i / max(1, self.iterations - 1)
             cur_hard_weight = self.init_density_weight + (self.max_density_weight - self.init_density_weight) * progress
             
-            # Soft macros get a small constant weight to avoid complete stacking
-            soft_weight = 0.01 
-            
-            total_loss = wl_loss + (cur_hard_weight * hard_density_loss) + (soft_weight * soft_density_loss)
+            total_loss = wl_loss + (cur_hard_weight * hard_density_loss) + (self.soft_density_weight * soft_density_loss)
             
             total_loss.backward()
             optimizer.step()
@@ -119,7 +119,7 @@ class DreamPlacer:
                         idx_movable += 1
 
             if (i + 1) % 10 == 0:
-                print(f"  Iteration {i+1:3d}/{self.iterations} | WL: {wl_loss.item():.6f} | HardDen: {hard_density_loss.item():.6f} (x{cur_hard_weight:.2f}) | SoftDen: {soft_density_loss.item():.6f} (x{soft_weight:.2f}) | Total: {total_loss.item():.6f}")
+                print(f"  Iteration {i+1:3d}/{self.iterations} | WL: {wl_loss.item():.6f} | HardDen: {hard_density_loss.item():.6f} (x{cur_hard_weight:.2f}) | SoftDen: {soft_density_loss.item():.6f} (x{self.soft_density_weight:.2f}) | Total: {total_loss.item():.6f}")
 
         # Final placement
         final_pos = pos.clone()
