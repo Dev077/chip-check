@@ -13,17 +13,19 @@ class DreamPlacer:
 
     def __init__(
         self,
-        iterations: int = 500,
-        lr: float = 1e-3,
+        iterations: int = 200,
+        lr: float = 1e-1,
         gamma: float = 10.0,
-        density_weight: float = 0.1,
+        init_density_weight: float = 1,
+        max_density_weight: float = 2.0,
         grid_size: int = 128,
         seed: int = 42
     ):
         self.iterations = iterations
         self.lr = lr
         self.gamma = gamma  # Smoothing parameter for WA wirelength
-        self.density_weight = density_weight
+        self.init_density_weight = init_density_weight
+        self.max_density_weight = max_density_weight
         self.grid_size = grid_size
         self.seed = seed
 
@@ -66,13 +68,42 @@ class DreamPlacer:
             # Loss 1: Wirelength (WA)
             wl_loss = self._compute_wa_wirelength(current_pos, benchmark, net_pin_nodes, macro_pin_offsets, port_positions, net_weights, device)
             
-            # Loss 2: Density
-            density_loss = self._compute_density_potential(current_pos, benchmark, macro_sizes, device)
+            # Loss 2: Density (Split into Hard and Soft)
+            # Hard macros: Indices [0, num_hard_macros)
+            # Soft macros: Indices [num_hard_macros, num_macros)
+            
+            # Hard Macro Density - Targeting 100% occupancy to prevent overlaps
+            hard_mask = torch.arange(num_macros, device=device) < benchmark.num_hard_macros
+            hard_density_loss = self._compute_density_potential(
+                current_pos[hard_mask], 
+                macro_sizes[hard_mask], 
+                canvas_w, canvas_h, device,
+                target_density=1.0 # Strict target for legalization
+            )
+            
+            # Soft Macro Density - Targeting global average to keep them spread but flexible
+            soft_mask = ~hard_mask
+            if soft_mask.any():
+                total_soft_area = (macro_sizes[soft_mask, 0] * macro_sizes[soft_mask, 1]).sum()
+                soft_target = (total_soft_area / (canvas_w * canvas_h)).item()
+                soft_density_loss = self._compute_density_potential(
+                    current_pos[soft_mask],
+                    macro_sizes[soft_mask],
+                    canvas_w, canvas_h, device,
+                    target_density=soft_target
+                )
+            else:
+                soft_density_loss = torch.tensor(0.0, device=device)
             
             # Total Loss
-            # Gradually increase density weight to resolve overlaps
-            cur_density_weight = self.density_weight * (1.0 + i / self.iterations * 10.0)
-            total_loss = wl_loss + cur_density_weight * density_loss
+            # Ramping weight only applies to the "illegal" hard macro overlaps
+            progress = i / max(1, self.iterations - 1)
+            cur_hard_weight = self.init_density_weight + (self.max_density_weight - self.init_density_weight) * progress
+            
+            # Soft macros get a small constant weight to avoid complete stacking
+            soft_weight = 0.01 
+            
+            total_loss = wl_loss + (cur_hard_weight * hard_density_loss) + (soft_weight * soft_density_loss)
             
             total_loss.backward()
             optimizer.step()
@@ -87,8 +118,8 @@ class DreamPlacer:
                         movable_pos.data[idx_movable, 1].clamp_(h/2, canvas_h - h/2)
                         idx_movable += 1
 
-            if (i + 1) % 1 == 0:
-                print(f"  Iteration {i+1}/{self.iterations} | WL: {wl_loss.item():.4f} | Den: {density_loss.item():.4f} | Total: {total_loss.item():.4f}")
+            if (i + 1) % 10 == 0:
+                print(f"  Iteration {i+1:3d}/{self.iterations} | WL: {wl_loss.item():.6f} | HardDen: {hard_density_loss.item():.6f} | Weight: {cur_hard_weight:.4f} | Total: {total_loss.item():.6f}")
 
         # Final placement
         final_pos = pos.clone()
@@ -112,9 +143,6 @@ class DreamPlacer:
             # Hard macro offsets
             hard_macro_mask = owner_idx < benchmark.num_hard_macros
             if hard_macro_mask.any():
-                # We need to apply offsets. Since macro_pin_offsets is a list, 
-                # we can't easily vectorize without more preprocessing.
-                # However, for macros in a net, we can apply them.
                 for pin_in_net_idx in torch.where(hard_macro_mask)[0]:
                     o_idx = owner_idx[pin_in_net_idx].item()
                     p_idx = pin_idx[pin_in_net_idx].item()
@@ -145,11 +173,12 @@ class DreamPlacer:
         
         return wa_u - wa_l
 
-    def _compute_density_potential(self, pos: torch.Tensor, benchmark: Benchmark, macro_sizes, device) -> torch.Tensor:
-        """Differentiable grid-based density potential."""
+    def _compute_density_potential(self, pos: torch.Tensor, sizes: torch.Tensor, canvas_w: float, canvas_h: float, device, target_density: float = 1.0) -> torch.Tensor:
+        """Differentiable grid-based density potential for a subset of macros."""
+        if pos.size(0) == 0:
+            return torch.tensor(0.0, device=device)
+            
         grid_size = self.grid_size
-        canvas_w = benchmark.canvas_width
-        canvas_h = benchmark.canvas_height
         cell_w, cell_h = canvas_w / grid_size, canvas_h / grid_size
         
         # Grid coordinates
@@ -157,7 +186,7 @@ class DreamPlacer:
         grid_y = torch.linspace(cell_h/2, canvas_h - cell_h/2, grid_size, device=device)
         
         macro_x, macro_y = pos[:, 0], pos[:, 1]
-        macro_w, macro_h = macro_sizes[:, 0], macro_sizes[:, 1]
+        macro_w, macro_h = sizes[:, 0], sizes[:, 1]
         
         def get_weights(c, s, g, cs):
             # c: [N], s: [N], g: [G], cs: float
@@ -173,8 +202,7 @@ class DreamPlacer:
         areas = (macro_w * macro_h).unsqueeze(1)
         density = torch.matmul(wx.t(), wy * areas)
         
-        target_density = (macro_w * macro_h).sum() / (canvas_w * canvas_h)
         density_norm = density / (cell_w * cell_h)
         
-        # MSE against target density (only penalizing overflow for simpler repulsion)
+        # Penalty for exceeding target occupancy
         return torch.mean((density_norm - target_density).clamp(min=0)**2)
