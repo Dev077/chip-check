@@ -119,7 +119,7 @@ class DreamPlacer:
                         idx_movable += 1
 
             if (i + 1) % 10 == 0:
-                print(f"  Iteration {i+1:3d}/{self.iterations} | WL: {wl_loss.item():.6f} | HardDen: {hard_density_loss.item():.6f} | Weight: {cur_hard_weight:.4f} | Total: {total_loss.item():.6f}")
+                print(f"  Iteration {i+1:3d}/{self.iterations} | WL: {wl_loss.item():.6f} | HardDen: {hard_density_loss.item():.6f} (x{cur_hard_weight:.2f}) | SoftDen: {soft_density_loss.item():.6f} (x{soft_weight:.2f}) | Total: {total_loss.item():.6f}")
 
         # Final placement
         final_pos = pos.clone()
