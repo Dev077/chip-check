@@ -79,11 +79,36 @@ class DreamPlacer:
         # Use Adam but with smaller lr if normalization is working
         optimizer = optim.Adam([movable_pos], lr=self.lr)
         
-        net_pin_nodes = [net.to(device) for net in benchmark.net_pin_nodes]
-        macro_pin_offsets = [off.to(device) for off in benchmark.macro_pin_offsets]
         port_positions = benchmark.port_positions.to(device)
         macro_sizes = benchmark.macro_sizes.to(device)
         net_weights = benchmark.net_weights.to(device)
+        
+        # 1b. Flatten Net Data for Fused Wirelength
+        # Pre-calculate flattened pin data once to avoid per-iteration overhead
+        flat_net_pin_owners = torch.cat([net[:, 0] for net in benchmark.net_pin_nodes]).to(device)
+        flat_pin_indices = torch.cat([net[:, 1] for net in benchmark.net_pin_nodes]).to(device)
+        
+        net_sizes = torch.tensor([len(net) for net in benchmark.net_pin_nodes], device=device)
+        flat_net_ids = torch.repeat_interleave(torch.arange(benchmark.num_nets, device=device), net_sizes)
+        
+        # Flattened Offsets: map (owner, pin) to [dx, dy]
+        if benchmark.macro_pin_offsets:
+            all_offsets = torch.cat(benchmark.macro_pin_offsets).to(device)
+            offset_starts = torch.zeros(benchmark.num_hard_macros + 1, dtype=torch.long, device=device)
+            offset_starts[1:] = torch.cumsum(torch.tensor([off.size(0) for off in benchmark.macro_pin_offsets], device=device), dim=0)
+            
+            is_hard = flat_net_pin_owners < benchmark.num_hard_macros
+            flat_net_pin_offsets = torch.zeros((len(flat_net_pin_owners), 2), device=device)
+            if is_hard.any():
+                hp_owners = flat_net_pin_owners[is_hard]
+                hp_pins = flat_pin_indices[is_hard]
+                global_pin_indices = offset_starts[hp_owners] + hp_pins
+                flat_net_pin_offsets[is_hard] = all_offsets[global_pin_indices]
+        else:
+            flat_net_pin_offsets = torch.zeros((len(flat_net_pin_owners), 2), device=device)
+            
+        canvas_sum = benchmark.canvas_width + benchmark.canvas_height
+        total_net_weight = net_weights.sum()
         
         print(f"Starting Poisson DREAMPlace optimization on {device}")
         
@@ -94,8 +119,12 @@ class DreamPlacer:
             current_pos = pos.clone()
             current_pos[movable_mask] = movable_pos
             
-            # Loss 1: Wirelength
-            wl_loss = self._compute_wa_wirelength(current_pos, benchmark, net_pin_nodes, macro_pin_offsets, port_positions, net_weights, device)
+            # Loss 1: Wirelength (Fused & Optimized)
+            wl_loss = self._compute_wa_wirelength(
+                current_pos, port_positions, 
+                flat_net_pin_owners, flat_net_pin_offsets, flat_net_ids, 
+                net_weights, canvas_sum, total_net_weight
+            )
             
             # Loss 2: Poisson Density (Hard Macros)
             hard_mask = torch.arange(num_macros, device=device) < benchmark.num_hard_macros
@@ -166,30 +195,54 @@ class DreamPlacer:
         final_pos[movable_mask] = movable_pos.detach()
         return final_pos.cpu()
 
-    def _compute_wa_wirelength(self, pos, benchmark, net_pin_nodes, macro_pin_offsets, port_positions, net_weights, device):
-        total_wa = torch.tensor(0.0, device=device)
+    @torch.compile
+    def _compute_wa_wirelength(
+        self, 
+        pos: torch.Tensor, 
+        port_positions: torch.Tensor, 
+        flat_net_pin_owners: torch.Tensor, 
+        flat_net_pin_offsets: torch.Tensor, 
+        flat_net_ids: torch.Tensor, 
+        net_weights: torch.Tensor, 
+        canvas_sum: float, 
+        total_net_weight: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Fused Weighted-Average wirelength calculation.
+        Uses torch.compile for kernel fusion and scatter_reduce for group-by operations.
+        """
         all_owner_pos = torch.cat([pos, port_positions], dim=0)
-        for net_idx, net_pins in enumerate(net_pin_nodes):
-            owner_idx = net_pins[:, 0]
-            pin_idx = net_pins[:, 1]
-            pins_abs = all_owner_pos[owner_idx].clone()
-            hard_macro_mask = owner_idx < benchmark.num_hard_macros
-            if hard_macro_mask.any():
-                for idx in torch.where(hard_macro_mask)[0]:
-                    o_idx = owner_idx[idx].item()
-                    p_idx = pin_idx[idx].item()
-                    pins_abs[idx] = pins_abs[idx] + macro_pin_offsets[o_idx][p_idx]
-            total_wa = total_wa + (self._wa_1d(pins_abs[:, 0]) + self._wa_1d(pins_abs[:, 1])) * net_weights[net_idx]
-        return total_wa / ((benchmark.canvas_width + benchmark.canvas_height) * net_weights.sum() + 1e-8)
+        # Gather all pin positions: [num_pins, 2]
+        pins_abs = all_owner_pos[flat_net_pin_owners] + flat_net_pin_offsets
+        
+        num_nets = net_weights.size(0)
+        # Function to compute WA for a single dimension (X or Y)
+        def compute_dim_wa(coords):
+            # Per-net max/min for numerical stability in exp()
+            c_max = torch.scatter_reduce(torch.empty(num_nets, device=coords.device), 0, flat_net_ids, coords, reduce='amax', include_self=False)
+            c_min = torch.scatter_reduce(torch.empty(num_nets, device=coords.device), 0, flat_net_ids, coords, reduce='amin', include_self=False)
+            
+            # exp((x - x_max) / gamma) and exp((x_min - x) / gamma)
+            exp_u = torch.exp((coords - c_max[flat_net_ids]) / self.gamma)
+            exp_l = torch.exp((c_min[flat_net_ids] - coords) / self.gamma)
+            
+            # Weighted sums for numerators and denominators
+            num_u = torch.scatter_reduce(torch.empty(num_nets, device=coords.device), 0, flat_net_ids, coords * exp_u, reduce='sum', include_self=False)
+            den_u = torch.scatter_reduce(torch.empty(num_nets, device=coords.device), 0, flat_net_ids, exp_u, reduce='sum', include_self=False)
+            
+            num_l = torch.scatter_reduce(torch.empty(num_nets, device=coords.device), 0, flat_net_ids, coords * exp_l, reduce='sum', include_self=False)
+            den_l = torch.scatter_reduce(torch.empty(num_nets, device=coords.device), 0, flat_net_ids, exp_l, reduce='sum', include_self=False)
+            
+            return (num_u / (den_u + 1e-6)) - (num_l / (den_l + 1e-6))
 
-    def _wa_1d(self, x):
-        if x.size(0) <= 1: return torch.tensor(0.0, device=x.device)
-        x_max, x_min = torch.max(x), torch.min(x)
-        exp_u = torch.exp((x - x_max) / self.gamma)
-        exp_l = torch.exp((x_min - x) / self.gamma)
-        wa_u = torch.sum(x * exp_u) / (torch.sum(exp_u) + 1e-6)
-        wa_l = torch.sum(x * exp_l) / (torch.sum(exp_l) + 1e-6)
-        return wa_u - wa_l
+        wa_x = compute_dim_wa(pins_abs[:, 0])
+        wa_y = compute_dim_wa(pins_abs[:, 1])
+        
+        # Combine and weight by net
+        total_wa = torch.sum((wa_x + wa_y) * net_weights)
+        
+        # Normalize by canvas size and total weight
+        return total_wa / (canvas_sum * total_net_weight + 1e-8)
 
     def _compute_poisson_density(self, pos, sizes, canvas_w, canvas_h, device, target_density):
         if pos.size(0) == 0: return torch.tensor(0.0, device=device)
