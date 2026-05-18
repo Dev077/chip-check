@@ -279,15 +279,29 @@ def main():
     )
     args = parser.parse_args()
 
+    # Resolve all repo-relative assets from the package location, not CWD.
+    repo_root = Path(__file__).resolve().parents[1]
+
     # ── resolve paths ────────────────────────────────────────────────────
-    testcase_root = Path("external/MacroPlacement/Testcases/ICCAD04")
+    testcase_root = repo_root / "external/MacroPlacement/Testcases/ICCAD04"
     if not args.ng45 and not testcase_root.exists():
         print(f"Error: Testcases not found at {testcase_root}")
         print("Run: git submodule update --init external/MacroPlacement")
         sys.exit(1)
 
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+
     # ── load placer ──────────────────────────────────────────────────────
     placer_path = Path(args.placer)
+    if not placer_path.exists():
+        candidate = repo_root / placer_path
+        if candidate.exists():
+            placer_path = candidate
+    if not placer_path.exists():
+        print(f"Error: Placer file not found at {args.placer}")
+        print(f"Tried: {Path(args.placer).resolve()} and {repo_root / Path(args.placer)}")
+        sys.exit(1)
     placer = _load_placer(placer_path)
     placer_name = type(placer).__name__
 
@@ -308,7 +322,11 @@ def main():
     results = []
     for name in benchmarks_to_run:
         print(f"  {name}...", end=" ", flush=True)
-        ng45_dir = NG45_BENCHMARKS.get(name) if args.ng45 or name in NG45_BENCHMARKS else None
+        ng45_dir = (
+            str(repo_root / NG45_BENCHMARKS[name])
+            if args.ng45 or name in NG45_BENCHMARKS
+            else None
+        )
         result = evaluate_benchmark(placer, name, str(testcase_root), ng45_dir=ng45_dir)
         results.append(result)
 
