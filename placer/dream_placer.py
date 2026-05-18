@@ -2,6 +2,8 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.fft
+import torch._functorch.config
+torch._functorch.config.donated_buffer = False
 from typing import List, Tuple, Optional
 from macro_place.benchmark import Benchmark
 
@@ -16,11 +18,11 @@ class DreamPlacer:
 
     def __init__(
         self,
-        iterations: int = 500,
-        lr: float = 1.0,
+        iterations: int = 100,
+        lr: float = 1e-1,
         gamma: float = 10.0,
         init_density_weight: float = 0.1,
-        max_density_weight: float = 10.0,
+        max_density_weight: float = 20.0,
         soft_density_weight: float = 0.01,
         grid_size: int = 128,
         seed: int = 42
