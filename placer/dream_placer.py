@@ -13,6 +13,7 @@ except Exception:
 from typing import List, Tuple, Optional
 from macro_place.benchmark import Benchmark
 from placer.legalizer import Legalizer
+from placer.soft_spreader import SoftSpreader
 
 
 def _maybe_compile(fn):
@@ -214,6 +215,7 @@ class DreamPlacer:
         final_pos = final_pos.cpu()
         if self.legalize:
             final_pos = Legalizer().legalize(final_pos, benchmark)
+        final_pos = SoftSpreader().spread(final_pos, benchmark)
         return final_pos
 
     @_maybe_compile
