@@ -14,6 +14,7 @@ from typing import List, Tuple, Optional
 from macro_place.benchmark import Benchmark
 from placer.legalizer import Legalizer
 from placer.soft_spreader import SoftSpreader
+from placer.orientation_optimizer import OrientationOptimizer
 
 
 def _maybe_compile(fn):
@@ -216,6 +217,7 @@ class DreamPlacer:
         if self.legalize:
             final_pos = Legalizer().legalize(final_pos, benchmark)
         final_pos = SoftSpreader().spread(final_pos, benchmark)
+        final_pos, _orientations = OrientationOptimizer().optimize(final_pos, benchmark)
         return final_pos
 
     @_maybe_compile

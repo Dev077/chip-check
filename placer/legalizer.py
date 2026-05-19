@@ -62,6 +62,7 @@ class Legalizer:
         spacing_um_ibm: float = 0.0,
         anchor_top_k: Optional[int] = None,
         anchor_area_frac: float = 0.1,
+        anchor_area_floor: float = 50.0,
         fit_cells_per_side: int = 200,
         spiral_step_frac: float = 0.005,
         spiral_max_radius_frac: float = 0.5,
@@ -82,6 +83,13 @@ class Legalizer:
         # reaches anchor_area_frac of total movable area.
         self.anchor_top_k = anchor_top_k
         self.anchor_area_frac = anchor_area_frac
+        # Absolute area floor for anchoring: any macro with area >= this
+        # value is anchored, regardless of the fraction calculation. Catches
+        # "medium" macros that aren't large enough to enter the cumulative
+        # top-N% but are still big enough to need a legal slot reserved
+        # early (e.g., 13×17 in a 77×77 canvas like ibm10).
+        # In grid² units.
+        self.anchor_area_floor = anchor_area_floor
         # Resolution of the fit-pass slot grid (cells per longer canvas side).
         # 200 is a good balance — fine enough to give the assignment freedom,
         # coarse enough to keep the cost matrix tractable.
@@ -236,7 +244,22 @@ class Legalizer:
     # ----------------------------------------------------------- anchor pass
 
     def _pick_anchors(self, movable_idx: List[int], sizes: torch.Tensor) -> set:
-        """Return indices of the 'big' macros to place greedily first."""
+        """
+        Return indices of the 'big' macros to place greedily first.
+
+        Two criteria combined (union):
+          - Fraction-based: any macro whose cumulative area is in the top
+            `anchor_area_frac` of total movable area. Adapts to designs
+            with a few giant macros vs many medium macros.
+          - Absolute floor: any macro with area >= `anchor_area_floor`.
+            Catches macros that aren't large enough to clear the cumulative
+            top-N% (e.g., when one or two giants dominate the area sum) but
+            are still individually too big to find a slot after the canvas
+            fills up — ibm10's macro 146 (13×17 = 222 grid²) is the
+            canonical case.
+
+        `anchor_top_k` (if set) overrides both and just takes the K largest.
+        """
         if not movable_idx:
             return set()
         areas = (sizes[:, 0] * sizes[:, 1]).tolist()
@@ -245,19 +268,21 @@ class Legalizer:
         if self.anchor_top_k is not None:
             return set(sorted_by_area[: self.anchor_top_k])
 
-        # Anchor anyone whose cumulative area is in the top
-        # `anchor_area_frac` of movable area. This adapts to designs with
-        # a few giant macros (NG45) vs many medium macros (IBM).
+        # Fraction-based set.
         total_area = sum(areas[i] for i in movable_idx)
         cutoff_area = total_area * self.anchor_area_frac
-        anchors = set()
+        fraction_anchors = set()
         running = 0.0
         for i in sorted_by_area:
-            anchors.add(i)
+            fraction_anchors.add(i)
             running += areas[i]
             if running >= cutoff_area:
                 break
-        return anchors
+
+        # Absolute floor set.
+        floor_anchors = {i for i in movable_idx if areas[i] >= self.anchor_area_floor}
+
+        return fraction_anchors | floor_anchors
 
     def _spiral_legal_slot(
         self,
