@@ -35,10 +35,10 @@ class SoftSpreader:
 
     def __init__(
         self,
-        iterations: int = 200,
+        iterations: int = 100,
         lr: float = 1.0,
         gamma: float = 10.0,
-        density_weight: float = 1.0,
+        density_weight: float = 5.0,
         grid_size: int = 128,
         seed: int = 42,
         verbose: bool = True,
@@ -97,21 +97,66 @@ class SoftSpreader:
 
         optimizer = optim.Adam([soft_pos], lr=self.lr)
 
-        # Target density: total movable area / canvas area. This is the
-        # uniform-spread floor — pushing past it would mean leaving the
-        # canvas, which is impossible. Hard macros are *included* in the
-        # density field (they take up real space) but we set the target
-        # to all-macro area / canvas so the density loss is calibrated to
-        # the achievable spread.
+        # Target density. Keep as tensor to avoid a host sync on GPU.
         total_area = (macro_sizes[:, 0] * macro_sizes[:, 1]).sum()
-        target_density = (total_area / (canvas_w * canvas_h)).item()
-        target_density = min(target_density, 1.0)
+        target_density = torch.clamp(
+            total_area / (canvas_w * canvas_h), max=1.0
+        )
 
         if self.verbose:
             print(
                 f"[SoftSpreader] spreading {num_soft} soft macros on {device} | "
-                f"target_density={target_density:.3f}"
+                f"target_density={target_density.item():.3f}"
             )
+
+        # ── Precompute padded per-net tensors for batched WA wirelength ──
+        # The original loop iterated each net in Python and looked up pin
+        # offsets one at a time. That's fine on CPU but launches one kernel
+        # per net on GPU — death by 1000 cuts. Here we pad every net to
+        # `max_pins_per_net` and store:
+        #
+        #   pin_owner_pad  [num_nets, max_pins]   — int, owner index
+        #                                            (num_macros + port_idx for ports)
+        #   pin_offset_pad [num_nets, max_pins, 2] — float, pre-resolved offset
+        #                                            (zero for soft/port pins)
+        #   pin_mask       [num_nets, max_pins]    — float, 1.0 for real pins, 0.0 pad
+        #
+        # All wirelength math then reduces to a few vectorised ops over
+        # the full [num_nets, max_pins, …] tensors, no Python loops.
+        max_pins_per_net = max((n.shape[0] for n in net_pin_nodes), default=1)
+        num_nets = len(net_pin_nodes)
+
+        pin_owner_pad = torch.zeros(num_nets, max_pins_per_net, dtype=torch.long, device=device)
+        pin_offset_pad = torch.zeros(num_nets, max_pins_per_net, 2, device=device)
+        pin_mask = torch.zeros(num_nets, max_pins_per_net, device=device)
+
+        for net_idx, net_pins in enumerate(net_pin_nodes):
+            n_pins = net_pins.shape[0]
+            owner = net_pins[:, 0]
+            slot = net_pins[:, 1]
+            pin_owner_pad[net_idx, :n_pins] = owner
+            pin_mask[net_idx, :n_pins] = 1.0
+            # For hard owners, resolve the per-pin offset. Soft owners
+            # and ports keep zero offset.
+            hard_in_net = owner < num_hard
+            if hard_in_net.any():
+                hard_pos_in_net = torch.where(hard_in_net)[0]
+                safe_owner = owner[hard_pos_in_net]
+                safe_slot = slot[hard_pos_in_net]
+                # macro_pin_offsets[o] is [num_pins_for_o, 2]; gather by slot.
+                offs = torch.stack([
+                    macro_pin_offsets[safe_owner[k].item()][safe_slot[k].item()]
+                    for k in range(safe_owner.shape[0])
+                ]) if safe_owner.shape[0] > 0 else torch.zeros(0, 2, device=device)
+                pin_offset_pad[net_idx, hard_pos_in_net] = offs
+
+        self._pin_owner_pad = pin_owner_pad
+        self._pin_offset_pad = pin_offset_pad
+        self._pin_mask = pin_mask
+        self._net_weights = net_weights
+        self._num_hard = num_hard
+        self._num_macros = num_macros
+
 
         for it in range(self.iterations):
             # Assemble full position tensor (hard fixed, soft trainable).
@@ -155,7 +200,7 @@ class SoftSpreader:
                 soft_pos.data[:, 0].clamp_(w * 0.5, canvas_w - w * 0.5)
                 soft_pos.data[:, 1].clamp_(h * 0.5, canvas_h - h * 0.5)
 
-            if self.verbose and (it + 1) % 25 == 0:
+            if self.verbose and (it + 1) % 5 == 0:
                 print(
                     f"[SoftSpreader]   iter {it + 1:3d} | "
                     f"WL: {wl_loss.item():.4f} | Den: {den_loss.item():.4f} | "
@@ -193,26 +238,68 @@ class SoftSpreader:
         self, pos, benchmark, net_pin_nodes, macro_pin_offsets,
         port_positions, net_weights, device,
     ):
-        total_wa = torch.tensor(0.0, device=device)
-        all_owner_pos = torch.cat([pos, port_positions], dim=0)
-        for net_idx, net_pins in enumerate(net_pin_nodes):
-            owner_idx = net_pins[:, 0]
-            pin_idx = net_pins[:, 1]
-            pins_abs = all_owner_pos[owner_idx].clone()
-            # Add per-pin offsets for hard macros (soft macros + ports have
-            # implicit zero offsets — their pins coincide with the center).
-            hard_macro_mask = owner_idx < benchmark.num_hard_macros
-            if hard_macro_mask.any():
-                for idx in torch.where(hard_macro_mask)[0]:
-                    o_idx = owner_idx[idx].item()
-                    p_idx = pin_idx[idx].item()
-                    pins_abs[idx] = pins_abs[idx] + macro_pin_offsets[o_idx][p_idx]
-            total_wa = total_wa + (
-                self._wa_1d(pins_abs[:, 0]) + self._wa_1d(pins_abs[:, 1])
-            ) * net_weights[net_idx]
-        return total_wa / (
-            (benchmark.canvas_width + benchmark.canvas_height) * net_weights.sum() + 1e-8
-        )
+        """
+        Fully batched WA wirelength: no Python loop over nets or pins.
+
+        Uses precomputed per-net padded tensors from `spread()`. The arguments
+        `benchmark`, `net_pin_nodes`, `macro_pin_offsets`, `net_weights` are
+        kept for signature parity with DreamPlacer; the actual data comes from
+        the `self._*_pad` attributes built once per benchmark.
+        """
+        # all_owner_pos = [macros; ports] indexed by owner_idx (matches the
+        # convention used when net_pin_nodes was constructed).
+        all_owner_pos = torch.cat([pos, port_positions], dim=0)  # [num_owners, 2]
+
+        # Gather per-pin coords: [num_nets, max_pins, 2].
+        pins_abs = all_owner_pos[self._pin_owner_pad] + self._pin_offset_pad
+
+        # Zero out padded pins so they don't influence per-net min/max/sum.
+        # We do this by masking in the exp domain: real pins get the actual
+        # exp value, pads get 0 in the numerator and 0 in the denominator,
+        # which falls out of the WA average exactly.
+        mask = self._pin_mask                            # [num_nets, max_pins]
+
+        # For numerical stability the classic WA trick subtracts the per-net
+        # max/min before exponentiation. With masked pins we need a max/min
+        # that ignores pads. Use a very-negative sentinel for max and very-
+        # positive for min before reducing.
+        NEG_INF = torch.finfo(pins_abs.dtype).min / 2
+        POS_INF = torch.finfo(pins_abs.dtype).max / 2
+
+        x = pins_abs[..., 0]
+        y = pins_abs[..., 1]
+        x_for_max = torch.where(mask > 0, x, torch.full_like(x, NEG_INF))
+        x_for_min = torch.where(mask > 0, x, torch.full_like(x, POS_INF))
+        y_for_max = torch.where(mask > 0, y, torch.full_like(y, NEG_INF))
+        y_for_min = torch.where(mask > 0, y, torch.full_like(y, POS_INF))
+
+        x_max = x_for_max.max(dim=1, keepdim=True).values
+        x_min = x_for_min.min(dim=1, keepdim=True).values
+        y_max = y_for_max.max(dim=1, keepdim=True).values
+        y_min = y_for_min.min(dim=1, keepdim=True).values
+
+        # Compute exp_u and exp_l, masked so padded pins contribute 0.
+        exp_xu = torch.exp((x - x_max) / self.gamma) * mask
+        exp_xl = torch.exp((x_min - x) / self.gamma) * mask
+        exp_yu = torch.exp((y - y_max) / self.gamma) * mask
+        exp_yl = torch.exp((y_min - y) / self.gamma) * mask
+
+        # Per-net WA values: shape [num_nets].
+        eps = 1e-6
+        wa_xu = (x * exp_xu).sum(dim=1) / (exp_xu.sum(dim=1) + eps)
+        wa_xl = (x * exp_xl).sum(dim=1) / (exp_xl.sum(dim=1) + eps)
+        wa_yu = (y * exp_yu).sum(dim=1) / (exp_yu.sum(dim=1) + eps)
+        wa_yl = (y * exp_yl).sum(dim=1) / (exp_yl.sum(dim=1) + eps)
+
+        # Per-net wirelength (HPWL-style sum of x-span and y-span).
+        # Nets with 0 or 1 real pins yield ~0 here: with 1 pin, the WA
+        # average equals that pin's value, so wa_u - wa_l = 0. Good.
+        per_net_wl = (wa_xu - wa_xl) + (wa_yu - wa_yl)
+
+        # Weighted sum across nets, normalized by (W+H) * total_weight.
+        total = (per_net_wl * self._net_weights).sum()
+        denom = (benchmark.canvas_width + benchmark.canvas_height) * self._net_weights.sum() + 1e-8
+        return total / denom
 
     def _wa_1d(self, x):
         if x.size(0) <= 1:
