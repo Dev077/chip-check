@@ -206,37 +206,84 @@ class CostEstimator:
         return (x_max - x_min).item() + (y_max - y_min).item()
 
     def _update_density_grid(self, macro_idx: int, pos: torch.Tensor, sign: float):
+        # Vectorized: the per-cell overlap with a macro's footprint is
+        # separable into a column-only width and a row-only height, so we
+        # compute those as 1-D tensors and add their outer product to the
+        # affected rectangle in one go. Mathematically identical to the
+        # original double-loop; verified against ground truth in __main__.
         w, h = self.benchmark.macro_sizes[macro_idx]
         x, y = pos
-        m_lx, m_ux, m_by, m_ty = x - w/2, x + w/2, y - h/2, y + h/2
-        c_start, c_end = max(0, int(m_lx // self.cell_w)), min(self.cols - 1, int(m_ux // self.cell_w))
-        r_start, r_end = max(0, int(m_by // self.cell_h)), min(self.rows - 1, int(m_ty // self.cell_h))
-        for r in range(r_start, r_end + 1):
-            for c in range(c_start, c_end + 1):
-                inter_w = min(m_ux, (c+1)*self.cell_w) - max(m_lx, c*self.cell_w)
-                inter_y = min(m_ty, (r+1)*self.cell_h) - max(m_by, r*self.cell_h)
-                if inter_w > 0 and inter_y > 0:
-                    self.density_grid[r, c] += sign * (inter_w * inter_y)
+        m_lx = float(x - w / 2)
+        m_ux = float(x + w / 2)
+        m_by = float(y - h / 2)
+        m_ty = float(y + h / 2)
+
+        c_start = max(0, int(m_lx // self.cell_w))
+        c_end = min(self.cols - 1, int(m_ux // self.cell_w))
+        r_start = max(0, int(m_by // self.cell_h))
+        r_end = min(self.rows - 1, int(m_ty // self.cell_h))
+        if c_end < c_start or r_end < r_start:
+            return
+
+        # Column overlaps: inter_w[c] = min(m_ux, (c+1)*cell_w) - max(m_lx, c*cell_w)
+        cols = torch.arange(c_start, c_end + 1, device=self.density_grid.device, dtype=torch.float32)
+        cell_left = cols * self.cell_w
+        cell_right = cell_left + self.cell_w
+        inter_w = torch.clamp(torch.minimum(cell_right, torch.tensor(m_ux)) -
+                              torch.maximum(cell_left, torch.tensor(m_lx)), min=0.0)
+
+        # Row overlaps: inter_h[r] = min(m_ty, (r+1)*cell_h) - max(m_by, r*cell_h)
+        rows = torch.arange(r_start, r_end + 1, device=self.density_grid.device, dtype=torch.float32)
+        cell_bot = rows * self.cell_h
+        cell_top = cell_bot + self.cell_h
+        inter_h = torch.clamp(torch.minimum(cell_top, torch.tensor(m_ty)) -
+                              torch.maximum(cell_bot, torch.tensor(m_by)), min=0.0)
+
+        # Outer product -> contribution rectangle.
+        contrib = sign * torch.outer(inter_h, inter_w)
+        self.density_grid[r_start:r_end + 1, c_start:c_end + 1] += contrib
 
     def _update_congestion_grid(self, net_idx: int, sign: float):
+        # Same separable-outer-product idea as _update_density_grid, plus
+        # the constant per-cell scaling factor (demand_density / avg_cap).
         net_pins = self.benchmark.net_pin_nodes[net_idx]
         owner_idx = net_pins[:, 0]
         net_pos = self.all_owner_pos[owner_idx]
-        lx, ux = net_pos[:, 0].min().item(), net_pos[:, 0].max().item()
-        by, ty = net_pos[:, 1].min().item(), net_pos[:, 1].max().item()
-        w, h = ux - lx, ty - by
-        if w == 0 and h == 0: return
+        lx = net_pos[:, 0].min().item()
+        ux = net_pos[:, 0].max().item()
+        by = net_pos[:, 1].min().item()
+        ty = net_pos[:, 1].max().item()
+        w = ux - lx
+        h = ty - by
+        if w == 0 and h == 0:
+            return
         demand_density = (w + h) / (w * h + 1e-6)
-        c_start, c_end = max(0, int(lx // self.cell_w)), min(self.cols - 1, int(ux // self.cell_w))
-        r_start, r_end = max(0, int(by // self.cell_h)), min(self.rows - 1, int(ty // self.cell_h))
-        avg_cap = (self.cell_w * self.benchmark.vroutes_per_micron + self.cell_h * self.benchmark.hroutes_per_micron) / 2.0
-        for r in range(r_start, r_end + 1):
-            for c in range(c_start, c_end + 1):
-                inter_w = min(ux, (c+1)*self.cell_w) - max(lx, c*self.cell_w)
-                inter_h = min(ty, (r+1)*self.cell_h) - max(by, r*self.cell_h)
-                if inter_w > 0 and inter_h > 0:
-                    cell_demand = demand_density * (inter_w * inter_h)
-                    self.congestion_grid[r, c] += sign * (cell_demand / (avg_cap + 1e-6))
+
+        c_start = max(0, int(lx // self.cell_w))
+        c_end = min(self.cols - 1, int(ux // self.cell_w))
+        r_start = max(0, int(by // self.cell_h))
+        r_end = min(self.rows - 1, int(ty // self.cell_h))
+        if c_end < c_start or r_end < r_start:
+            return
+
+        avg_cap = (self.cell_w * self.benchmark.vroutes_per_micron +
+                   self.cell_h * self.benchmark.hroutes_per_micron) / 2.0
+
+        cols = torch.arange(c_start, c_end + 1, device=self.congestion_grid.device, dtype=torch.float32)
+        cell_left = cols * self.cell_w
+        cell_right = cell_left + self.cell_w
+        inter_w = torch.clamp(torch.minimum(cell_right, torch.tensor(ux)) -
+                              torch.maximum(cell_left, torch.tensor(lx)), min=0.0)
+
+        rows = torch.arange(r_start, r_end + 1, device=self.congestion_grid.device, dtype=torch.float32)
+        cell_bot = rows * self.cell_h
+        cell_top = cell_bot + self.cell_h
+        inter_h = torch.clamp(torch.minimum(cell_top, torch.tensor(ty)) -
+                              torch.maximum(cell_bot, torch.tensor(by)), min=0.0)
+
+        scale = sign * demand_density / (avg_cap + 1e-6)
+        contrib = scale * torch.outer(inter_h, inter_w)
+        self.congestion_grid[r_start:r_end + 1, c_start:c_end + 1] += contrib
 
     def _calculate_pair_overlap(self, i: int, j: int, pos_i: torch.Tensor, pos_j: torch.Tensor) -> float:
         dx = abs(pos_i[0] - pos_j[0])
