@@ -157,9 +157,15 @@ class OrientationOptimizer:
                 # what we just passed. Improvement is baseline - best.
                 total_improvement += float(baseline - best_hpwl)
 
-        # Persist updated offsets onto the Benchmark so anything reading
-        # benchmark.macro_pin_offsets downstream sees the right values.
-        benchmark.macro_pin_offsets = pin_offsets
+        # Note: we deliberately do NOT write `pin_offsets` back to
+        # `benchmark.macro_pin_offsets`. The greedy loop above used a local
+        # copy so later macros see the effect of earlier orientation choices
+        # — but the final scoring path (evaluate.py → compute_proxy_cost)
+        # doesn't read `benchmark.macro_pin_offsets`, it reads the plc's
+        # own stored offsets. Mutating the benchmark here would make any
+        # downstream in-process HPWL check disagree with the evaluator,
+        # which is a footgun for no benefit. Orientations transfer to the
+        # real scoring environment via the sidecar below.
 
         if self.verbose:
             counts = [int((codes == c).sum().item()) for c in range(4)]
