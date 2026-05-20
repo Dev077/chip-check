@@ -66,7 +66,7 @@ class MultiSeedDreamSA:
         self,
         time_budget_s: float = 3300.0,
         dream_seeds: Sequence[int] = (42, 1042, 2042, 3042),
-        dream_iterations: int = 60,
+        dream_iterations: int = 100,
         sa_num_chains: int = 4,
         sa_top_k_starts: int = 2,
         time_split: tuple = (0.20, 0.78, 0.02),
