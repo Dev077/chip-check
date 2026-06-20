@@ -114,7 +114,7 @@ This closes the surrogate-truth gap that bottlenecks analytical GP.
 Final Scores on the IBM benchmark and compared against SA baseline and RePlace
 
 <p align="center">
-  <img src="images/ibm/your-picture.png" width="80%" />
+  <img src="images/final_score_on_IBM_benchmarks/IBM_benchmark_score.png" width="80%" />
 </p>
 
 To see the full set of visualisation, it's under the [`images/ibm/`](images/ibm/).
