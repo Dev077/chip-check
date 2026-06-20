@@ -130,22 +130,22 @@ Full set under [`images/ibm/`](images/ibm/).
 
 ---
 
-## Repo layout
+## layout
 
 ```
-nuclear/
-├── mise_en_place/             # French for "everything in its place" — the placer
-│   ├── pipeline.py            GraphGradPlacer    main pipeline orchestrator
-│   ├── lk_pipeline.py         LKPlacer           five-phase variant
-│   ├── gp.py                  Phase α₁           focused-Poisson electrostatic GP
-│   ├── legalize.py            Phase 0            push-apart + spiral legalizer
-│   ├── evaluator.py           Phase 1            FastEvaluator (bit-exact, incremental)
-│   ├── subgradient.py         Phase α₂           true-cost stochastic subgradient
-│   ├── lk.py                  Phase 2            Lin-Kernighan k-opt
-│   ├── cong_attack.py         Phase 2.5          direct congestion attack
-│   ├── lahc.py                Phase 3            LAHC polish
-│   ├── regional.py            Phase 4            hierarchical regional LAHC (CPU)
-│   └── regional_gpu.py        Phase 4            multi-start parallel chains (GPU)
+
+mise_en_place/             # French for "everything in its place" — the placer
+├── pipeline.py            GraphGradPlacer    main pipeline orchestrator
+├── lk_pipeline.py         LKPlacer           five-phase variant
+├── gp.py                  Phase α₁           focused-Poisson electrostatic GP
+├── legalize.py            Phase 0            push-apart + spiral legalizer
+├── evaluator.py           Phase 1            FastEvaluator (bit-exact, incremental)
+├── subgradient.py         Phase α₂           true-cost stochastic subgradient
+├── lk.py                  Phase 2            Lin-Kernighan k-opt
+├── cong_attack.py         Phase 2.5          direct congestion attack
+├── lahc.py                Phase 3            LAHC polish
+├── regional.py            Phase 4            hierarchical regional LAHC (CPU)
+└── regional_gpu.py        Phase 4            multi-start parallel chains (GPU)
 └── images/
     └── ibm/                   ICCAD'04 IBM benchmark visualizations
 ```
