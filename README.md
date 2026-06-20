@@ -1,4 +1,6 @@
-# Nuclear
+# Chip-Check
+
+> Final Submission for the Partcl x HRT [macro-placement challenge] (https://github.com/partcleda/macro-place-challenge-2026)
 
 **A multi-phase macro placer for VLSI chip design.**
 Analytical global placement, bit-exact incremental evaluation, and metaheuristic
@@ -151,25 +153,6 @@ mise_en_place/             # French for "everything in its place" — the placer
 ```
 
 ---
-
-## Usage
-
-```python
-from mise_en_place.pipeline import GraphGradPlacer
-
-placer = GraphGradPlacer(
-    seed=42,
-    time_budget_s=800,
-    gp_pop_size=8,
-    soft_K=16,
-    lk_passes=2,
-    regional_grid_sizes=(3, 5, 7),
-)
-positions = placer.place(benchmark)
-```
-
-`benchmark` is a `macro_place.benchmark.Benchmark` from the surrounding
-ICCAD'04 / NanGate45 loader framework.
 
 ### Requirements
 - Python 3.9+
