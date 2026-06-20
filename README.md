@@ -111,24 +111,13 @@ This closes the surrogate-truth gap that bottlenecks analytical GP.
 
 ## Results
 
-Visualizations of placements produced by the pipeline on the ICCAD'04 IBM
-benchmark suite (`ibm01` – `ibm18`):
+Final Scores on the IBM benchmark and compared against SA baseline and RePlace
 
 <p align="center">
-  <img src="images/ibm/ibm02.png" width="24%" />
-  <img src="images/ibm/ibm04.png" width="24%" />
-  <img src="images/ibm/ibm09.png" width="24%" />
-  <img src="images/ibm/ibm14.png" width="24%" />
+  <img src="images/ibm/your-picture.png" width="80%" />
 </p>
 
-<p align="center">
-  <img src="images/ibm/ibm15.png" width="24%" />
-  <img src="images/ibm/ibm16.png" width="24%" />
-  <img src="images/ibm/ibm17.png" width="24%" />
-  <img src="images/ibm/ibm18.png" width="24%" />
-</p>
-
-Full set under [`images/ibm/`](images/ibm/).
+To see the full set of visualisation, it's under the [`images/ibm/`](images/ibm/).
 
 ---
 
