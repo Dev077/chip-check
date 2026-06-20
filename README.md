@@ -1,6 +1,6 @@
 # Chip-Check
 
-> Final Submission for the Partcl x HRT [macro-placement challenge] (https://github.com/partcleda/macro-place-challenge-2026)
+> Final Submission for the [Partcl x HRT Macro-Placement Challenge](https://github.com/partcleda/macro-place-challenge-2026)
 
 **A multi-phase macro placer for VLSI chip design.**
 Analytical global placement, bit-exact incremental evaluation, and metaheuristic
